@@ -1,0 +1,27 @@
+{
+  "version": "2026.09-v1",
+  "description": "Example business rules. Score = weighted sum of normalised signals in [0,1]; thresholds map the score to LOW / MEDIUM / HIGH. Overrides encode non-negotiable policy.",
+  "weights": {
+    "self_confidence": 0.30,
+    "tests_passed_ratio": 0.35,
+    "change_size": 0.15,
+    "artifact_risk": 0.20
+  },
+  "artifact_type_risk": {
+    "code": 0.5,
+    "excel_model": 0.6,
+    "report": 0.3,
+    "data_pipeline": 0.8,
+    "other": 0.5
+  },
+  "change_size_scale_lines": 400,
+  "thresholds": {
+    "high": 0.80,
+    "low": 0.45
+  },
+  "overrides": {
+    "min_tests_ratio_for_non_low": 0.30,
+    "external_side_effects_max_category": "MEDIUM",
+    "max_lines_for_high": 800
+  }
+}
