@@ -82,7 +82,24 @@ void MiningCoordinator::mine(size_t idx, const chain::BlockHeader& header) {
         }
         auto res = std::to_chars(buf, buf + sizeof(buf), nonce);
         hasher.hash(buf, static_cast<size_t>(res.ptr - buf), digest);
-        if (crypto::leading_zero_bits(digest, 32) >= header.difficulty_bits) {
+        int lead = crypto::leading_zero_bits(digest, 32);
+
+        // Record the closest attempt so far, and a periodic live sample, so the UI can show
+        // what each miner is actually trying instead of just a hash counter.
+        if (lead > slot.best_bits.load(std::memory_order_relaxed)) {
+            slot.best_bits.store(lead, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> sg(slot.sample_mu);
+            slot.best_nonce = nonce;
+            slot.best_hash = crypto::to_hex(digest, 32);
+        }
+        if ((nonce & 0xFFF) == 0) {
+            std::lock_guard<std::mutex> sg(slot.sample_mu);
+            slot.sample_nonce = nonce;
+            slot.sample_hash = crypto::to_hex(digest, 32);
+            slot.sample_bits = lead;
+        }
+
+        if (lead >= header.difficulty_bits) {
             slot.hashes.store(nonce + 1, std::memory_order_relaxed);
             bool expected = false;
             bool won = found_.compare_exchange_strong(expected, true);
@@ -201,12 +218,29 @@ json MiningCoordinator::snapshot() {
         auto& s = *slots_[i];
         uint64_t h = s.hashes.load(std::memory_order_relaxed);
         total += h;
+        uint64_t best_nonce, sample_nonce;
+        std::string best_hash, sample_hash;
+        int sample_bits;
+        {
+            std::lock_guard<std::mutex> sg(s.sample_mu);
+            best_nonce = s.best_nonce;
+            best_hash = s.best_hash;
+            sample_nonce = s.sample_nonce;
+            sample_hash = s.sample_hash;
+            sample_bits = s.sample_bits;
+        }
         miners.push_back({{"name", s.miner.name},
                           {"hashes", h},
                           {"hashrate", h / secs},
                           {"status", state_name(s.state.load())},
                           {"nonce", s.hash.empty() ? json(nullptr) : json(s.nonce)},
-                          {"hash", s.hash.empty() ? json(nullptr) : json(s.hash)}});
+                          {"hash", s.hash.empty() ? json(nullptr) : json(s.hash)},
+                          {"best_bits", s.best_bits.load(std::memory_order_relaxed)},
+                          {"best_nonce", best_hash.empty() ? json(nullptr) : json(best_nonce)},
+                          {"best_hash", best_hash.empty() ? json(nullptr) : json(best_hash)},
+                          {"sample_nonce", sample_hash.empty() ? json(nullptr) : json(sample_nonce)},
+                          {"sample_hash", sample_hash.empty() ? json(nullptr) : json(sample_hash)},
+                          {"sample_bits", sample_bits}});
     }
     return {{"round", round_no_},
             {"running", running_.load()},

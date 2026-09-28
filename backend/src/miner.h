@@ -34,6 +34,16 @@ private:
         uint64_t nonce = 0;
         std::string hash;
         int64_t found_at_ms = 0;
+
+        // Live telemetry for visualizing the search, guarded by sample_mu (separate from the
+        // coordinator's mu_ so the hot mining loop never contends with round-management locks).
+        std::atomic<int> best_bits{-1};
+        std::mutex sample_mu;
+        uint64_t best_nonce = 0;
+        std::string best_hash;   // closest attempt found so far (most leading zero bits)
+        uint64_t sample_nonce = 0;
+        std::string sample_hash;  // most recent attempt, sampled periodically
+        int sample_bits = -1;
     };
 
     void run_round(int difficulty_bits);

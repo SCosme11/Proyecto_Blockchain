@@ -180,6 +180,29 @@ export default function MiningArena({
                     nonce {fmtNum(m.nonce ?? 0)} → <Hash value={m.hash} len={10} zeros />
                   </div>
                 )}
+                {m.status === 'mining' && (
+                  <div className="attempt">
+                    <div className="lbl">
+                      <span>closest attempt</span>
+                      <span>{m.best_bits >= 0 ? `${m.best_bits}/${snap?.difficulty_bits ?? bits} zero bits` : '—'}</span>
+                    </div>
+                    <div className="bar bits">
+                      <i style={{ width: `${Math.min(100, (Math.max(0, m.best_bits) / (snap?.difficulty_bits || 1)) * 100)}%` }} />
+                    </div>
+                    {m.best_hash && (
+                      <div className="trying">
+                        <span className="tag">best</span>
+                        {fmtNum(m.best_nonce ?? 0)} → <Hash value={m.best_hash} len={12} zeros />
+                      </div>
+                    )}
+                    {m.sample_hash && (
+                      <div className="trying">
+                        <span className="tag">trying</span>
+                        {fmtNum(m.sample_nonce ?? 0)} → <Hash value={m.sample_hash} len={12} zeros />
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>

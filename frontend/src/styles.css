@@ -167,6 +167,11 @@ tr.selected td { background: var(--accent-soft); }
 .miner.stale { opacity: .6; }
 .miner .name { font-weight: 600; font-family: var(--mono); }
 .miner .big { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.bar.bits > i { background: var(--high); }
+.attempt { margin-top: 8px; }
+.attempt .lbl { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; margin-bottom: 3px; }
+.attempt .trying { font-size: 11.5px; margin-top: 6px; color: var(--muted); overflow-wrap: anywhere; }
+.attempt .tag { text-transform: uppercase; font-size: 9px; letter-spacing: .04em; background: var(--surface-2); border-radius: 4px; padding: 1px 4px; margin-right: 5px; }
 .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1s infinite; }
 @keyframes pulse { 50% { opacity: .25; } }
 .stat { display: flex; flex-direction: column; }

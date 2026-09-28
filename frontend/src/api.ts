@@ -107,6 +107,13 @@ export interface MinerLive {
   status: 'idle' | 'mining' | 'winner' | 'late' | 'stale';
   nonce: number | null;
   hash: string | null;
+  // Live search telemetry, for visualizing what the miner is trying.
+  best_bits: number;
+  best_nonce: number | null;
+  best_hash: string | null;
+  sample_nonce: number | null;
+  sample_hash: string | null;
+  sample_bits: number;
 }
 
 export interface MiningSnapshot {
