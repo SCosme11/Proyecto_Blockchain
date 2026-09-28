@@ -391,9 +391,9 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
         return arr;
     };
 
-    svr.Get("/api/miners", wrap([&](const httplib::Request&, httplib::Response& res) { send(res, miners_json()); }));
+    svr.Get("/api/miners", wrap([miners_json](const httplib::Request&, httplib::Response& res) { send(res, miners_json()); }));
 
-    svr.Post("/api/miners", wrap([&](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/miners", wrap([&, miners_json](const httplib::Request& req, httplib::Response& res) {
                  int n = body(req).value("count", 4);
                  if (n < 1 || n > ctx.max_miners) throw HttpError(400, "count out of range");
                  ctx.ledger.ensure_miners(n);
