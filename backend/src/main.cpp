@@ -15,19 +15,22 @@ static void connect_or_create(Db& db) {
     try {
         db.connect(Db::conninfo_from_env());
         return;
-    } catch (const DbError& e) {
-        std::string msg = e.what();
-        if (msg.find("does not exist") == std::string::npos) throw;
-    }
-    std::string name = env::get("PGDATABASE", "ai_ledger");
-    std::cout << "database '" << name << "' not found, creating it..." << std::endl;
-    {
+    } catch (const DbError& first) {
+        // The server's error text is localized ("does not exist" / "no existe" / ...), so don't
+        // match on it: ask the maintenance DB whether the target exists instead.
+        std::string name = env::get("PGDATABASE", "ai_ledger");
         Db admin;
         std::string ci = Db::conninfo_from_env();
         std::string target = "dbname='" + name + "'";
         auto pos = ci.find(target);
         if (pos != std::string::npos) ci.replace(pos, target.size(), "dbname='postgres'");
-        admin.connect(ci);
+        try {
+            admin.connect(ci);
+        } catch (const DbError&) {
+            throw first;  // server unreachable / bad credentials: report the original error
+        }
+        if (admin.exec("SELECT 1 FROM pg_database WHERE datname = $1", {name}).rows() > 0) throw first;
+        std::cout << "database '" << name << "' not found, creating it..." << std::endl;
         std::string quoted = "\"";
         for (char c : name) quoted += (c == '"') ? std::string("\"\"") : std::string(1, c);
         admin.exec("CREATE DATABASE " + quoted + "\"");
@@ -68,14 +71,16 @@ int main() {
     }
     std::cout << "  chain height: " << ledger.tip().header.height << std::endl;
 
-    MiningCoordinator miner(ledger, db, env::get_int("MAX_TX_PER_BLOCK", 10));
+    int64_t initial_stake = env::get_int("INITIAL_STAKE", 100);
+    NodeNetwork network;
+    ConsensusCoordinator consensus(ledger, db, network, env::get_int("MAX_TX_PER_BLOCK", 10), initial_stake);
     AppContext ctx{db,
                    ledger,
+                   consensus,
+                   network,
                    rules,
-                   miner,
-                   env::get_int("DEFAULT_DIFFICULTY_BITS", 20),
+                   initial_stake,
                    env::get_int("MAX_TX_PER_BLOCK", 10),
-                   env::get_int("MAX_MINERS", 16),
                    static_cast<int64_t>(env::get_int("TIMESTAMP_SKEW_SECONDS", 300)) * 1000};
 
     httplib::Server svr;

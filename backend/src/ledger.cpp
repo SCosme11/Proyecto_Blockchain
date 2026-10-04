@@ -1,5 +1,6 @@
 #include "ledger.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -14,11 +15,14 @@ BlockRow block_from_result(const Result& r, int row) {
     b.header.prev_hash = r.str(row, "prev_hash");
     b.header.merkle_root = r.str(row, "merkle_root");
     b.header.timestamp_ms = r.i64(row, "timestamp_ms");
-    b.header.difficulty_bits = static_cast<int>(r.i64(row, "difficulty_bits"));
-    b.header.miner = r.str(row, "miner_name");
+    b.header.proposer = r.str(row, "proposer_name");
     b.header.nonce = static_cast<uint64_t>(r.i64(row, "nonce"));
+    b.header.difficulty_hex_zeros = static_cast<int>(r.i64(row, "difficulty_hex_zeros"));
     b.hash = r.str(row, "hash");
-    b.miner_signature = r.str(row, "miner_signature");
+    b.mode = r.str(row, "mode");
+    b.proposer_signature = r.str(row, "proposer_signature");
+    b.quorum_stake = r.i64(row, "quorum_stake");
+    b.total_stake = r.i64(row, "total_stake");
     b.tx_count = static_cast<int>(r.i64(row, "tx_count"));
     return b;
 }
@@ -36,9 +40,10 @@ void Ledger::ensure_genesis() {
     if (db_.exec("SELECT 1 FROM blocks WHERE height = 0").rows() > 0) return;
     chain::BlockHeader g = chain::genesis_header();
     db_.exec(
-        "INSERT INTO blocks (height, hash, prev_hash, merkle_root, timestamp_ms, difficulty_bits, nonce, "
-        "miner_name, miner_signature, tx_count) VALUES (0,$1,$2,$3,$4,0,0,$5,'',0)",
-        {chain::block_hash(g), g.prev_hash, g.merkle_root, g.timestamp_ms, g.miner});
+        "INSERT INTO blocks (height, hash, prev_hash, merkle_root, timestamp_ms, mode, nonce, "
+        "difficulty_hex_zeros, proposer_name, proposer_signature, quorum_stake, total_stake, tx_count) "
+        "VALUES (0,$1,$2,$3,$4,'pos',0,0,$5,'',0,0,0)",
+        {chain::block_hash(g), g.prev_hash, g.merkle_root, g.timestamp_ms, g.proposer});
 }
 
 BlockRow Ledger::tip() {
@@ -79,41 +84,176 @@ std::vector<TxRow> Ledger::block_txs(int64_t height) {
     return out;
 }
 
-std::vector<MinerRow> Ledger::ensure_miners(int n) {
+static NodeRow node_from_result(const Result& r, int i) {
+    NodeRow v;
+    v.id = static_cast<int>(r.i64(i, "id"));
+    v.name = r.str(i, "name");
+    v.public_key_spki = r.str(i, "public_key_spki");
+    v.private_key_pem = r.str(i, "private_key_pem");
+    v.stake = r.i64(i, "stake");
+    v.active = r.str(i, "active") == "t";
+    v.slashed = r.str(i, "slashed") == "t";
+    v.dishonest = r.str(i, "dishonest") == "t";
+    return v;
+}
+
+std::vector<NodeRow> Ledger::ensure_nodes(int n, int64_t initial_stake) {
     auto l = db_.lock();
     for (int i = 1; i <= n; ++i) {
         char name[32];
-        std::snprintf(name, sizeof(name), "miner-%02d", i);
-        if (db_.exec("SELECT 1 FROM miners WHERE name = $1", {name}).rows() == 0) {
+        std::snprintf(name, sizeof(name), "node-%02d", i);
+        if (db_.exec("SELECT 1 FROM nodes WHERE name = $1", {name}).rows() == 0) {
             auto kp = crypto::generate_p256();
-            db_.exec("INSERT INTO miners (name, public_key_spki, private_key_pem) VALUES ($1,$2,$3)",
-                     {name, kp.public_spki_b64, kp.private_pem});
+            db_.exec(
+                "INSERT INTO nodes (name, public_key_spki, private_key_pem, stake) VALUES ($1,$2,$3,$4)",
+                {name, kp.public_spki_b64, kp.private_pem, initial_stake});
         }
     }
-    Result r = db_.exec("SELECT * FROM miners ORDER BY name LIMIT $1", {n});
-    std::vector<MinerRow> out;
-    for (int i = 0; i < r.rows(); ++i) {
-        MinerRow m;
-        m.id = static_cast<int>(r.i64(i, "id"));
-        m.name = r.str(i, "name");
-        m.public_key_spki = r.str(i, "public_key_spki");
-        m.private_key_pem = r.str(i, "private_key_pem");
-        out.push_back(m);
-    }
+    Result r = db_.exec("SELECT * FROM nodes ORDER BY name LIMIT $1", {n});
+    std::vector<NodeRow> out;
+    for (int i = 0; i < r.rows(); ++i) out.push_back(node_from_result(r, i));
     return out;
 }
 
-std::map<std::string, std::string> Ledger::miner_keys() {
-    Result r = db_.exec("SELECT name, public_key_spki FROM miners");
+std::vector<NodeRow> Ledger::nodes() {
+    Result r = db_.exec("SELECT * FROM nodes ORDER BY name");
+    std::vector<NodeRow> out;
+    for (int i = 0; i < r.rows(); ++i) out.push_back(node_from_result(r, i));
+    return out;
+}
+
+std::map<std::string, std::string> Ledger::node_keys() {
+    Result r = db_.exec("SELECT name, public_key_spki FROM nodes");
     std::map<std::string, std::string> out;
     for (int i = 0; i < r.rows(); ++i) out[r.str(i, "name")] = r.str(i, "public_key_spki");
     return out;
 }
 
+int64_t Ledger::total_active_stake() {
+    Result r = db_.exec("SELECT COALESCE(SUM(stake), 0) AS total FROM nodes WHERE active AND NOT slashed");
+    return r.i64(0, "total");
+}
+
+bool Ledger::adjust_stake(int node_id, int64_t delta, std::string& err) {
+    auto l = db_.lock();
+    Result r = db_.exec("SELECT stake, slashed FROM nodes WHERE id = $1", {node_id});
+    if (r.rows() == 0) {
+        err = "node not found";
+        return false;
+    }
+    if (r.str(0, "slashed") == "t") {
+        err = "node is slashed and cannot change its stake";
+        return false;
+    }
+    int64_t new_stake = r.i64(0, "stake") + delta;
+    if (new_stake < 0) {
+        err = "stake cannot go negative";
+        return false;
+    }
+    db_.exec("UPDATE nodes SET stake = $1 WHERE id = $2", {new_stake, node_id});
+    return true;
+}
+
+bool Ledger::set_dishonest(int node_id, bool dishonest, std::string& err) {
+    Result r = db_.exec("UPDATE nodes SET dishonest = $1 WHERE id = $2", {std::string(dishonest ? "true" : "false"), node_id});
+    if (r.affected() != 1) {
+        err = "node not found";
+        return false;
+    }
+    return true;
+}
+
+void Ledger::slash(int node_id, int64_t amount, bool bar, const std::string& reason, const json& evidence,
+                    std::optional<int64_t> block_height) {
+    auto l = db_.lock();
+    Result r = db_.exec("SELECT stake FROM nodes WHERE id = $1", {node_id});
+    if (r.rows() == 0) return;
+    int64_t before = r.i64(0, "stake");
+    int64_t cut = std::min(amount, before);
+    int64_t after = before - cut;
+    if (bar) {
+        db_.exec("UPDATE nodes SET stake = $1, active = false, slashed = true WHERE id = $2", {after, node_id});
+    } else {
+        db_.exec("UPDATE nodes SET stake = $1 WHERE id = $2", {after, node_id});
+    }
+    db_.exec(
+        "INSERT INTO slashing_events (validator_id, reason, evidence, stake_before, stake_after, block_height) "
+        "VALUES ($1,$2,$3::jsonb,$4,$5,$6)",
+        {node_id, reason, evidence.dump(), before, after,
+         block_height ? Param(*block_height) : Param(std::nullopt)});
+}
+
+std::vector<VoteRow> Ledger::block_votes(int64_t height) {
+    Result r = db_.exec(
+        "SELECT bv.validator_id, v.name AS validator_name, bv.signature, bv.stake_at_vote, bv.voted_at_ms "
+        "FROM block_votes bv JOIN nodes v ON v.id = bv.validator_id WHERE bv.block_height = $1 ORDER BY bv.id",
+        {height});
+    std::vector<VoteRow> out;
+    for (int i = 0; i < r.rows(); ++i) {
+        VoteRow v;
+        v.validator_id = static_cast<int>(r.i64(i, "validator_id"));
+        v.validator_name = r.str(i, "validator_name");
+        v.signature = r.str(i, "signature");
+        v.stake_at_vote = r.i64(i, "stake_at_vote");
+        v.voted_at_ms = r.i64(i, "voted_at_ms");
+        out.push_back(v);
+    }
+    return out;
+}
+
+std::vector<chain::StakeEntry> Ledger::round_stake_snapshot(int64_t block_height) {
+    Result r = db_.exec("SELECT participants::text AS participants FROM consensus_rounds WHERE block_height = $1",
+                        {block_height});
+    std::vector<chain::StakeEntry> out;
+    if (r.rows() == 0) return out;
+    try {
+        json participants = json::parse(r.str(0, "participants"));
+        for (const auto& p : participants) {
+            chain::StakeEntry e;
+            e.name = p.value("validator", "");
+            e.stake = p.value("stake", 0LL);
+            out.push_back(e);
+        }
+    } catch (...) {
+        // malformed/missing snapshot surfaces as a proposer-selection mismatch in check_block
+    }
+    return out;
+}
+
+int Ledger::round_attempt(int64_t block_height) {
+    Result r = db_.exec("SELECT attempt FROM consensus_rounds WHERE block_height = $1", {block_height});
+    if (r.rows() == 0) return 0;
+    return static_cast<int>(r.i64(0, "attempt"));
+}
+
+void Ledger::mature_pow_rewards(int64_t current_height) {
+    db_.exec(
+        "UPDATE pow_rewards SET confirmed = true, confirmed_at = now() "
+        "WHERE NOT confirmed AND height + 6 <= $1",
+        {current_height});
+}
+
+std::vector<RewardRow> Ledger::rewards() {
+    Result r = db_.exec(
+        "SELECT pr.height, pr.miner_id, n.name AS miner_name, pr.confirmed FROM pow_rewards pr "
+        "JOIN nodes n ON n.id = pr.miner_id ORDER BY pr.height DESC");
+    std::vector<RewardRow> out;
+    for (int i = 0; i < r.rows(); ++i) {
+        RewardRow w;
+        w.height = r.i64(i, "height");
+        w.miner_id = static_cast<int>(r.i64(i, "miner_id"));
+        w.miner_name = r.str(i, "miner_name");
+        w.confirmed = r.str(i, "confirmed") == "t";
+        out.push_back(w);
+    }
+    return out;
+}
+
 std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::string& expected_prev,
                                              const std::vector<TxRow>& txs,
-                                             const std::map<std::string, std::string>& miner_keys,
-                                             bool check_artifacts) {
+                                             const std::map<std::string, std::string>& node_keys,
+                                             const std::vector<chain::StakeEntry>& stake_snapshot, int attempt,
+                                             const std::vector<VoteRow>& votes, bool check_artifacts) {
     std::vector<std::string> errs;
     const auto& h = b.header;
 
@@ -121,22 +261,45 @@ std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::strin
     if (recomputed != b.hash) errs.push_back("block hash mismatch: header hashes to " + recomputed.substr(0, 16) + "...");
 
     if (h.height == 0) {
-        if (!(h.prev_hash == chain::kZeroHash && h.miner == "genesis")) errs.push_back("invalid genesis block");
+        if (!(h.prev_hash == chain::kZeroHash && h.proposer == "genesis")) errs.push_back("invalid genesis block");
         return errs;
     }
 
     if (h.prev_hash != expected_prev) errs.push_back("prev_hash does not link to previous block");
-    if (!chain::meets_difficulty(b.hash, h.difficulty_bits))
-        errs.push_back("proof-of-work does not meet " + std::to_string(h.difficulty_bits) + " bits");
 
-    auto mk = miner_keys.find(h.miner);
-    if (mk == miner_keys.end()) {
-        errs.push_back("miner '" + h.miner + "' is not a registered (permissioned) miner");
-    } else if (!crypto::verify_p256(mk->second, b.hash, b.miner_signature)) {
-        errs.push_back("miner signature invalid");
+    if (b.mode == "pow") {
+        if (!chain::meets_difficulty(b.hash, h.difficulty_hex_zeros))
+            errs.push_back("proof-of-work does not meet " + std::to_string(h.difficulty_hex_zeros) + " hex zeros");
+    } else {
+        std::string expected_proposer = chain::select_proposer(stake_snapshot, expected_prev, h.height, attempt);
+        if (expected_proposer.empty() || expected_proposer != h.proposer)
+            errs.push_back("proposer '" + h.proposer + "' was not the stake-weighted selection for this height");
+
+        int64_t quorum_sum = 0;
+        for (const auto& v : votes) {
+            quorum_sum += v.stake_at_vote;
+            auto vk = node_keys.find(v.validator_name);
+            if (vk == node_keys.end()) {
+                errs.push_back("vote from unregistered validator '" + v.validator_name + "'");
+            } else if (!crypto::verify_p256(vk->second, b.hash, v.signature)) {
+                errs.push_back("vote signature invalid for '" + v.validator_name + "'");
+            }
+        }
+        if (quorum_sum != b.quorum_stake) errs.push_back("quorum_stake does not match the sum of recorded votes");
+        if (b.quorum_stake < chain::quorum_threshold(b.total_stake))
+            errs.push_back("quorum not reached: " + std::to_string(b.quorum_stake) + "/" +
+                           std::to_string(b.total_stake) + " stake signed");
+    }
+
+    auto pk = node_keys.find(h.proposer);
+    if (pk == node_keys.end()) {
+        errs.push_back("proposer '" + h.proposer + "' is not a registered node");
+    } else if (!crypto::verify_p256(pk->second, b.hash, b.proposer_signature)) {
+        errs.push_back("proposer signature invalid");
     }
 
     if (static_cast<int>(txs.size()) != b.tx_count) errs.push_back("transaction count mismatch");
+    if (txs.empty()) errs.push_back("a block must contain at least one transaction");
 
     std::vector<std::string> ids;
     for (const auto& t : txs) {
@@ -170,19 +333,23 @@ std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::strin
     return errs;
 }
 
-void Ledger::commit_block(const BlockRow& b, const std::vector<TxRow>& txs, const json& round) {
+void Ledger::commit_block(const BlockRow& b, const std::vector<TxRow>& txs,
+                          const std::vector<chain::StakeEntry>& stake_snapshot, int attempt,
+                          const std::vector<VoteRow>& votes, const json& round) {
     Db::Transaction tx(db_);
     BlockRow prev = tip();
     if (b.header.height != prev.header.height + 1) throw DbError("stale block: height already taken");
-    auto errs = check_block(b, prev.hash, txs, miner_keys(), false);
+    auto errs = check_block(b, prev.hash, txs, node_keys(), stake_snapshot, attempt, votes, false);
     if (!errs.empty()) throw DbError("block rejected: " + errs.front());
 
     const auto& h = b.header;
     db_.exec(
-        "INSERT INTO blocks (height, hash, prev_hash, merkle_root, timestamp_ms, difficulty_bits, nonce, "
-        "miner_name, miner_signature, tx_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-        {h.height, b.hash, h.prev_hash, h.merkle_root, h.timestamp_ms, h.difficulty_bits,
-         static_cast<int64_t>(h.nonce), h.miner, b.miner_signature, static_cast<int>(txs.size())});
+        "INSERT INTO blocks (height, hash, prev_hash, merkle_root, timestamp_ms, mode, nonce, "
+        "difficulty_hex_zeros, proposer_name, proposer_signature, quorum_stake, total_stake, tx_count) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        {h.height, b.hash, h.prev_hash, h.merkle_root, h.timestamp_ms, b.mode, static_cast<int64_t>(h.nonce),
+         h.difficulty_hex_zeros, h.proposer, b.proposer_signature, b.quorum_stake, b.total_stake,
+         static_cast<int>(txs.size())});
     for (size_t i = 0; i < txs.size(); ++i) {
         Result u = db_.exec(
             "UPDATE transactions SET status='confirmed', block_height=$1, block_index=$2 "
@@ -191,19 +358,31 @@ void Ledger::commit_block(const BlockRow& b, const std::vector<TxRow>& txs, cons
         if (u.affected() != 1) throw DbError("transaction " + txs[i].tx_id + " no longer in mempool");
         db_.exec("UPDATE work_items SET status='on_chain' WHERE id=$1", {txs[i].work_item_id});
     }
-    db_.exec("UPDATE miners SET blocks_mined = blocks_mined + 1 WHERE name=$1", {h.miner});
+    for (const auto& v : votes) {
+        db_.exec(
+            "INSERT INTO block_votes (block_height, validator_id, signature, stake_at_vote, voted_at_ms) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            {h.height, v.validator_id, v.signature, v.stake_at_vote, v.voted_at_ms});
+    }
+    db_.exec("UPDATE nodes SET blocks_proposed = blocks_proposed + 1 WHERE name=$1", {h.proposer});
     db_.exec(
-        "INSERT INTO mining_rounds (difficulty_bits, participants, winner, block_height, duration_ms, "
-        "hashes_total, outcome) VALUES ($1,$2,$3,$4,$5,$6,'sealed')",
-        {h.difficulty_bits, round["participants"].dump(), h.miner, h.height,
-         round["duration_ms"].get<int64_t>(), round["hashes_total"].get<int64_t>()});
+        "INSERT INTO consensus_rounds (mode, attempt, proposer, participants, block_height, quorum_stake, "
+        "total_stake, duration_ms, outcome) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sealed')",
+        {b.mode, attempt, h.proposer, round["participants"].dump(), h.height, b.quorum_stake, b.total_stake,
+         round["duration_ms"].get<int64_t>()});
+    if (b.mode == "pow") {
+        Result miner = db_.exec("SELECT id FROM nodes WHERE name = $1", {h.proposer});
+        if (miner.rows() == 1)
+            db_.exec("INSERT INTO pow_rewards (height, miner_id) VALUES ($1,$2)", {h.height, miner.i64(0, "id")});
+    }
+    mature_pow_rewards(h.height);
     tx.commit();
 }
 
 json Ledger::verify_chain() {
     auto l = db_.lock();
     Result r = db_.exec("SELECT * FROM blocks ORDER BY height");
-    auto keys = miner_keys();
+    auto keys = node_keys();
     json blocks = json::array();
     std::string prev_hash;
     json first_bad = nullptr;
@@ -212,7 +391,10 @@ json Ledger::verify_chain() {
     for (int i = 0; i < r.rows(); ++i) {
         BlockRow b = block_from_result(r, i);
         auto txs = block_txs(b.header.height);
-        auto errs = check_block(b, prev_hash, txs, keys, true);
+        auto stake_snapshot = round_stake_snapshot(b.header.height);
+        int attempt = round_attempt(b.header.height);
+        auto votes = block_votes(b.header.height);
+        auto errs = check_block(b, prev_hash, txs, keys, stake_snapshot, attempt, votes, true);
         if (b.header.height != expected_height) errs.push_back("height gap in chain");
         // Once a block is broken, every later block inherits a broken history.
         if (errs.empty() && !first_bad.is_null()) errs.push_back("descends from invalid block " + first_bad.dump());

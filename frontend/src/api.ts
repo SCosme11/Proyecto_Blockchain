@@ -13,9 +13,14 @@ export interface Config {
     [k: string]: unknown;
   };
   tx_version: string;
-  default_difficulty: number;
+  initial_stake: number;
   max_tx_per_block: number;
-  max_miners: number;
+  min_nodes: number;
+  max_nodes: number;
+  min_difficulty_hex_zeros: number;
+  max_difficulty_hex_zeros: number;
+  quorum_numerator: number;
+  quorum_denominator: number;
   timestamp_skew_ms: number;
 }
 
@@ -29,8 +34,10 @@ export interface Stats {
   confirmed: number;
   height: number;
   auditors: number;
-  miners: number;
-  mining: boolean;
+  nodes: number;
+  total_stake: number;
+  consensus_running: boolean;
+  consensus_mode: 'pow' | 'pos' | '';
 }
 
 export interface Metrics {
@@ -78,75 +85,132 @@ export interface Tx {
   tx_id_valid?: boolean;
 }
 
+export interface Vote {
+  validator: string;
+  signature: string;
+  stake: number;
+}
+
 export interface Block {
   height: number;
   hash: string;
   prev_hash: string;
   merkle_root: string;
   timestamp_ms: number;
-  difficulty_bits: number;
+  mode: 'pow' | 'pos';
   nonce: number;
-  miner: string;
-  miner_signature: string;
+  difficulty_hex_zeros: number;
+  proposer: string;
+  proposer_signature: string;
+  quorum_stake: number;
+  total_stake: number;
   tx_count: number;
   header_preimage: string;
+  votes?: Vote[];
   transactions?: Tx[];
 }
 
-export interface MinerInfo {
+export interface NodeInfo {
   id: number;
   name: string;
   fingerprint: string;
-  blocks_mined: number;
+  stake: number;
+  active: boolean;
+  slashed: boolean;
+  dishonest: boolean;
+  blocks_proposed: number;
+}
+
+export interface NodeSyncStatus {
+  node_id: number;
+  name: string;
+  height: number;
+  hash: string;
+  synced: boolean;
+  note: string | null;
+}
+
+export interface Reward {
+  height: number;
+  miner: string;
+  confirmed: boolean;
+}
+
+export interface LogEvent {
+  type: 'block' | 'round_rejected' | 'slash' | 'reward_confirmed';
+  message: string;
+  created_at: string;
 }
 
 export interface MinerLive {
   name: string;
-  hashes: number;
-  hashrate: number;
+  nonce: number;
+  attempts: number;
+  last_hash: string | null;
   status: 'idle' | 'mining' | 'winner' | 'late' | 'stale';
-  nonce: number | null;
-  hash: string | null;
-  // Live search telemetry, for visualizing what the miner is trying.
-  best_bits: number;
-  best_nonce: number | null;
-  best_hash: string | null;
-  sample_nonce: number | null;
-  sample_hash: string | null;
-  sample_bits: number;
 }
 
-export interface MiningSnapshot {
+export interface ValidatorLive {
+  name: string;
+  stake: number;
+  dishonest: boolean;
+  status: 'idle' | 'voting' | 'voted' | 'abstained';
+  signature: string | null;
+}
+
+export interface ConsensusResult {
+  outcome: 'sealed' | 'no_quorum' | 'rejected' | 'error';
+  proposer?: string;
+  height?: number;
+  hash?: string;
+  nonce?: number;
+  quorum_stake?: number;
+  total_stake?: number;
+  tx_count?: number;
+  attempts?: number;
+  error?: string;
+}
+
+export interface AttemptLogEntry {
+  attempt: number;
+  proposer: string;
+  dishonest: boolean;
+  quorum_stake: number;
+  total_stake: number;
+  outcome: 'sealed' | 'rejected' | 'rejected_retry' | 'no_quorum';
+}
+
+export interface ConsensusSnapshot {
   round: number;
   running: boolean;
-  difficulty_bits: number;
-  expected_hashes: number;
+  mode: 'pow' | 'pos' | '';
   height: number;
   prev_hash: string;
   tx_ids: string[];
   elapsed_ms: number;
-  total_hashes: number;
-  total_hashrate: number;
-  miners: MinerLive[];
-  result: null | {
-    outcome: 'sealed' | 'stopped' | 'rejected' | 'error';
-    winner?: string;
-    height?: number;
-    hash?: string;
-    nonce?: number;
-    tx_count?: number;
-    error?: string;
-  };
+  result: ConsensusResult | null;
+  // mode === 'pow'
+  miners?: MinerLive[];
+  // mode === 'pos'
+  proposer?: string;
+  attempt?: number;
+  total_stake?: number;
+  quorum_threshold?: number;
+  quorum_stake?: number;
+  attempts_log?: AttemptLogEntry[];
+  validators?: ValidatorLive[];
 }
 
 export interface Round {
   id: number;
-  difficulty_bits: number;
-  participants: { miner: string; hashes: number; status: string }[];
-  winner: string | null;
+  mode: 'pow' | 'pos';
+  attempt: number;
+  proposer: string | null;
+  participants: { validator: string; stake: number; vote: string }[];
   block_height: number | null;
+  quorum_stake: number;
+  total_stake: number;
   duration_ms: number;
-  hashes_total: number;
   outcome: string;
 }
 
@@ -211,18 +275,43 @@ export const api = {
   }) => request<Tx>('POST', '/api/transactions', body),
   mempool: () => request<Tx[]>('GET', '/api/mempool'),
 
-  miners: () => request<MinerInfo[]>('GET', '/api/miners'),
-  mine: (miners: number, difficulty_bits: number) =>
-    request<MiningSnapshot>('POST', '/api/mine', { miners, difficulty_bits }),
-  stopMining: () => request<unknown>('POST', '/api/mine/stop'),
+  nodes: () => request<NodeInfo[]>('GET', '/api/nodes'),
+  provisionNodes: (count: number, stake: number) => request<NodeInfo[]>('POST', '/api/nodes', { count, stake }),
+  adjustStake: (id: number, delta: number) => request<NodeInfo[]>('POST', `/api/nodes/${id}/stake`, { delta }),
+  setDishonest: (id: number, dishonest: boolean) =>
+    request<NodeInfo[]>('POST', `/api/nodes/${id}/dishonest`, { dishonest }),
+  nodesSync: () => request<NodeSyncStatus[]>('GET', '/api/nodes/sync'),
+  resyncNode: (id: number) => request<NodeSyncStatus[]>('POST', `/api/nodes/${id}/resync`),
+  rewards: () => request<Reward[]>('GET', '/api/rewards'),
+  events: () => request<LogEvent[]>('GET', '/api/events'),
+
+  propose: (
+    mode: 'pow' | 'pos',
+    nodes: number,
+    difficulty_hex_zeros: number,
+    abstain: number,
+    punishment_rule: 'A' | 'B' = 'A',
+    alpha = 1,
+  ) =>
+    request<ConsensusSnapshot>('POST', '/api/consensus/propose', {
+      mode,
+      nodes,
+      difficulty_hex_zeros,
+      abstain,
+      punishment_rule,
+      alpha,
+    }),
+  stopConsensus: () => request<unknown>('POST', '/api/consensus/stop'),
+  consensusStatus: () => request<ConsensusSnapshot>('GET', '/api/consensus/status'),
   rounds: () => request<Round[]>('GET', '/api/rounds'),
 
   blocks: () => request<Block[]>('GET', '/api/blocks'),
   block: (h: number) => request<Block>('GET', `/api/blocks/${h}`),
   verify: () => request<ChainVerification>('GET', '/api/chain/verify'),
 
-  tamper: (kind: 'tx_decision' | 'comment' | 'artifact' | 'block_nonce') =>
-    request<{ kind: string; target: string; change: string }>('POST', '/api/demo/tamper', { kind }),
+  tamper: (
+    kind: 'tx_decision' | 'comment' | 'artifact' | 'validator_signature' | 'node_copy' | 'reward_amount',
+  ) => request<{ kind: string; target: string; change: string }>('POST', '/api/demo/tamper', { kind }),
   restore: () => request<{ restored: number }>('POST', '/api/demo/restore'),
   reset: () => request<unknown>('POST', '/api/demo/reset'),
 };

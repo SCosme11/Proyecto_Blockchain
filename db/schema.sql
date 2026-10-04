@@ -11,14 +11,19 @@ CREATE TABLE IF NOT EXISTS auditors (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Permissioned miners (company nodes). Private key kept here ONLY for the demo:
--- in production each node holds its own key in an HSM / keystore.
-CREATE TABLE IF NOT EXISTS miners (
+-- Permissioned nodes (company machines). The same set of nodes acts as miners in PoW mode
+-- or as validators in PoS mode -- it is one identity/key-pair registry either way. Private
+-- key kept here ONLY for the demo: in production each node holds its own key in an HSM.
+CREATE TABLE IF NOT EXISTS nodes (
     id              SERIAL PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
     public_key_spki TEXT NOT NULL,
     private_key_pem TEXT NOT NULL,
-    blocks_mined    INTEGER NOT NULL DEFAULT 0,
+    stake           BIGINT NOT NULL DEFAULT 0,
+    active          BOOLEAN NOT NULL DEFAULT true,
+    slashed         BOOLEAN NOT NULL DEFAULT false,
+    dishonest       BOOLEAN NOT NULL DEFAULT false,  -- toggled by the demo to force invalid proposals
+    blocks_proposed INTEGER NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -43,17 +48,43 @@ CREATE TABLE IF NOT EXISTS work_items (
 CREATE INDEX IF NOT EXISTS work_items_category_status ON work_items (category, status);
 
 CREATE TABLE IF NOT EXISTS blocks (
-    height          BIGINT PRIMARY KEY,
-    hash            TEXT NOT NULL UNIQUE,
-    prev_hash       TEXT NOT NULL,
-    merkle_root     TEXT NOT NULL,
-    timestamp_ms    BIGINT NOT NULL,
-    difficulty_bits INTEGER NOT NULL,
-    nonce           BIGINT NOT NULL,
-    miner_name      TEXT NOT NULL,
-    miner_signature TEXT NOT NULL,                 -- miner's ECDSA signature over the block hash
-    tx_count        INTEGER NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    height              BIGINT PRIMARY KEY,
+    hash                TEXT NOT NULL UNIQUE,
+    prev_hash           TEXT NOT NULL,
+    merkle_root         TEXT NOT NULL,
+    timestamp_ms        BIGINT NOT NULL,
+    mode                TEXT NOT NULL DEFAULT 'pos' CHECK (mode IN ('pow','pos')),
+    nonce               BIGINT NOT NULL DEFAULT 0,   -- PoW: winning nonce. PoS: always 0.
+    difficulty_hex_zeros INTEGER NOT NULL DEFAULT 0, -- PoW: required leading hex zero digits.
+    proposer_name       TEXT NOT NULL,               -- winning miner (PoW) or sorteed validator (PoS)
+    proposer_signature  TEXT NOT NULL,              -- proposer's ECDSA signature over the block hash
+    quorum_stake        BIGINT NOT NULL,             -- PoS: stake that actually voted. PoW: 0.
+    total_stake         BIGINT NOT NULL,             -- PoS: quorum denominator. PoW: 0.
+    tx_count            INTEGER NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One signed vote per validator per block (PoS only); the sum of stake_at_vote must reach
+-- >= 2/3 of blocks.total_stake for the block to have been committed at all.
+CREATE TABLE IF NOT EXISTS block_votes (
+    id            SERIAL PRIMARY KEY,
+    block_height  BIGINT NOT NULL REFERENCES blocks(height),
+    validator_id  INTEGER NOT NULL REFERENCES nodes(id),
+    signature     TEXT NOT NULL,
+    stake_at_vote BIGINT NOT NULL,
+    voted_at_ms   BIGINT NOT NULL,
+    UNIQUE (block_height, validator_id)
+);
+
+-- PoW reward maturity: the reward for the block at `height` is pending until the chain
+-- reaches height+6, at which point it is credited (confirmed) to the miner -- a counter,
+-- never a transferable balance.
+CREATE TABLE IF NOT EXISTS pow_rewards (
+    height       BIGINT PRIMARY KEY REFERENCES blocks(height),
+    miner_id     INTEGER NOT NULL REFERENCES nodes(id),
+    confirmed    BOOLEAN NOT NULL DEFAULT false,
+    confirmed_at TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Signed human approvals. status: mempool -> confirmed (once mined into a block).
@@ -73,16 +104,34 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 CREATE INDEX IF NOT EXISTS transactions_status ON transactions (status);
 
-CREATE TABLE IF NOT EXISTS mining_rounds (
-    id              SERIAL PRIMARY KEY,
-    difficulty_bits INTEGER NOT NULL,
-    participants    JSONB NOT NULL,                -- per-miner hashes / status
-    winner          TEXT,
-    block_height    BIGINT,
-    duration_ms     BIGINT NOT NULL,
-    hashes_total    BIGINT NOT NULL,
-    outcome         TEXT NOT NULL,                 -- sealed | stopped | rejected
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+-- One row per consensus round or PoS proposal attempt (whether or not it produced a block).
+-- participants snapshots the stake table used for proposer selection, so verify_chain can
+-- re-check history even after later staking/slashing changed the live `nodes` table.
+CREATE TABLE IF NOT EXISTS consensus_rounds (
+    id            SERIAL PRIMARY KEY,
+    mode          TEXT NOT NULL CHECK (mode IN ('pow','pos')),
+    attempt       INTEGER NOT NULL DEFAULT 0,       -- PoS: redraw counter ("intento") within the round
+    proposer      TEXT,
+    participants  JSONB NOT NULL,                 -- [{validator, stake, vote: yes|absent|double_vote}]
+    block_height  BIGINT,
+    quorum_stake  BIGINT NOT NULL,
+    total_stake   BIGINT NOT NULL,
+    duration_ms   BIGINT NOT NULL,
+    outcome       TEXT NOT NULL CHECK (outcome IN ('sealed','no_quorum','rejected','rejected_retry')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Audit trail of slashing: a validator caught signing two conflicting blocks (equivocation)
+-- or proposing a dishonest/invalid block loses its stake and is barred from future rounds.
+CREATE TABLE IF NOT EXISTS slashing_events (
+    id            SERIAL PRIMARY KEY,
+    validator_id  INTEGER NOT NULL REFERENCES nodes(id),
+    reason        TEXT NOT NULL,                   -- double_vote | dishonest_proposal
+    evidence      JSONB NOT NULL,
+    stake_before  BIGINT NOT NULL,
+    stake_after   BIGINT NOT NULL,
+    block_height  BIGINT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Records edits made by the "tamper demo" so they can be reverted.

@@ -4,10 +4,10 @@ import { ErrorBox, usePoll } from './components/ui';
 import AgentSimulator from './tabs/AgentSimulator';
 import Auditor from './tabs/Auditor';
 import Mempool from './tabs/Mempool';
-import MiningArena from './tabs/MiningArena';
+import ConsensusArena from './tabs/ConsensusArena';
 import ChainExplorer from './tabs/ChainExplorer';
 
-type Tab = 'agent' | 'review' | 'mempool' | 'mining' | 'chain';
+type Tab = 'agent' | 'review' | 'mempool' | 'consensus' | 'chain';
 
 function loadTab(): Tab {
   try {
@@ -38,12 +38,12 @@ export default function App() {
     { id: 'agent', n: '1 · Agents', t: 'Agent work', c: stats?.work_total },
     { id: 'review', n: '2 · Human', t: 'Review & sign', c: stats?.pending_review },
     { id: 'mempool', n: '3 · Pending', t: 'Mempool', c: stats?.mempool },
-    { id: 'mining', n: '4 · Consensus', t: 'Mining arena', c: stats?.mining ? '⛏' : undefined },
+    { id: 'consensus', n: '4 · Consensus', t: 'Consensus arena', c: stats?.consensus_running ? '🛡' : undefined },
     { id: 'chain', n: '5 · Ledger', t: 'Chain', c: stats ? `#${stats.height}` : undefined },
   ];
 
   const resetAll = async () => {
-    if (!confirm('Delete all work items, transactions and blocks (keeps genesis, miners and auditors)?')) return;
+    if (!confirm('Delete all work items, transactions and blocks (keeps genesis, nodes and auditors)?')) return;
     await api.reset();
     reloadStats();
   };
@@ -54,7 +54,7 @@ export default function App() {
         <div>
           <h1>AI Agent Accountability Ledger</h1>
           <div className="sub">
-            Permissioned proof-of-work chain · human signatures for medium-confidence AI work
+            Permissioned PoW/PoS simulator (10–20 nodos) · human signatures for medium-confidence AI work
             {config && (
               <>
                 {' '}
@@ -87,8 +87,8 @@ export default function App() {
         <main>
           {tab === 'agent' && <AgentSimulator config={config} onChange={reloadStats} onGoReview={() => setTab('review')} />}
           {tab === 'review' && <Auditor onChange={reloadStats} onGoMempool={() => setTab('mempool')} />}
-          {tab === 'mempool' && <Mempool onGoMining={() => setTab('mining')} />}
-          {tab === 'mining' && <MiningArena config={config} onChange={reloadStats} onGoChain={() => setTab('chain')} />}
+          {tab === 'mempool' && <Mempool onGoConsensus={() => setTab('consensus')} />}
+          {tab === 'consensus' && <ConsensusArena config={config} onChange={reloadStats} onGoChain={() => setTab('chain')} />}
           {tab === 'chain' && <ChainExplorer />}
         </main>
       )}

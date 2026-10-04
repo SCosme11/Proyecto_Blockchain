@@ -9,27 +9,35 @@ Agent output ──hash──► Confidence rules ──► LOW    → sent back
                                                         │  reviewer re-hashes the artifact,
                                                         │  signs in the browser (ECDSA P-256)
                                                         ▼
-                                                    Mempool ──► N miners race (PoW) ──► Block ──► Chain
+                                                    Mempool ──► PoW or PoS (chosen per round) ──► Block ──► Chain
+                                                                   │
+                                                                   └─► broadcast to every node's own chain copy
 ```
 
-* **Backend:** C++17 (OpenSSL 3, libpq, cpp-httplib, nlohmann/json). It does the hashing, signature checks, mining, validation and the REST/SSE API.
+* **Backend:** C++17 (OpenSSL 3, libpq, cpp-httplib, nlohmann/json). It does the hashing, signature checks, both consensus modes, validation and the REST/SSE API.
 * **Frontend:** React + Vite + TypeScript. Reviewers sign with WebCrypto in the browser, so private keys never reach the server.
-* **Storage:** PostgreSQL.
+* **Storage:** PostgreSQL (the reference/durable chain); each simulated node additionally keeps its own in-memory chain mirror, updated by broadcast like the assignment guide asks for.
 
-## Why there is mining in a private chain
+This project follows `guia_simulador_blockchain.pdf` (Universidad Anáhuac México, examen de MT): a simulator with **both** a Proof-of-Work and a Proof-of-Stake mode, 10–20 nodes, signed transactions, and a long list of edge cases it must survive without crashing. The guide suggests Python + Flask; this project implements the same specification on the existing C++/PostgreSQL/React stack instead. The 4-page academic report justifying the math behind every design choice is in [`report/reporte.tex`](report/reporte.tex).
 
-Every node in a company chain has a known identity. So proof-of-work cannot stop fake identities here the way it does in Bitcoin (a Sybil attack is not a threat when every node is known). This project uses **permissioned proof-of-work**:
+## Two consensus modes, one block/transaction format
 
-| | What does it |
-|---|---|
-| Who may seal blocks | Only registered miners. Each one has its own key pair and signs the blocks it seals. |
-| Who seals the next block | The first miner to solve the PoW puzzle. This gives a fair winner with no coordinator. |
-| Cost of rewriting history | The PoW has to be redone, **and** each rewritten block needs a registered miner's signature, so any rewrite is traceable to a miner. |
-| Rate limiting | The difficulty (number of leading zero bits) controls how fast blocks are made. |
+Both modes share `chain::BlockHeader`, the canonical transaction format, and the per-node broadcast/validation rule; only the "who gets to seal the next block" rule differs.
 
-Each miner puts its own name and timestamp in its candidate header, so every miner searches a different part of the hash space. Bitcoin achieves the same with a per-miner coinbase transaction. There is no currency. Miners earn a "blocks sealed" count instead.
+| | V1 · Proof of Work | V2 · Proof of Stake |
+|---|---|---|
+| Who may seal blocks | Any registered node, as a miner. | Only the node a stake-weighted lottery ("sorteo") selects. |
+| Who wins | The first miner to find a nonce whose block hash has `d` leading **hex** zero digits. Miner `i` of `N` only tries nonces `i, i+N, i+2N, …` — disjoint by construction, so a tie is settled by **smallest winning nonce** (never a real collision). | A proposer drawn with probability proportional to its stake. The block seals once validators holding **≥ 2/3 of the active stake** sign it (the classic BFT bound, tolerating < 1/3 faulty/offline stake). |
+| Misbehavior | N/A (any registered key can mine). | A node flagged **dishonest** proposes a block with a corrupted signature; honest validators reject it, it is **slashed** following a configurable rule (`punishment_rule` on `POST /api/consensus/propose`): **A** forfeits the whole stake and bars the node forever, **B** forfeits only `ceil(alpha * stake)` (0 < alpha ≤ 1) and keeps the node eligible — and the sorteo repeats with an incremented "intento" over the remaining pool either way. |
+| Reward | Pending until the chain reaches `height + 6` ("6 confirmations"), then confirmed — a counter, never a spendable balance. | Stake is itself the counter; it is adjusted directly (`POST /api/nodes/:id/stake`), never transferred between nodes. |
 
-For production, the race can be replaced by round-robin Proof-of-Authority without changing the transaction or block formats.
+There is no transferable balance and no double-spend concern anywhere in the system (by design — see `report/reporte.tex` §5): "stake" and "reward" are bookkeeping counters, not currency.
+
+## Node range and chain copies
+
+* `10 ≤ N ≤ 20` nodes, enforced server-side (`POST /api/nodes`, `POST /api/consensus/propose`) regardless of what the UI already restricts to.
+* Every node additionally keeps its **own** in-memory chain mirror (`backend/src/network.*`). After a block is sealed on the reference ledger it is broadcast to every mirror; each one independently re-runs the **full** block check (`Ledger::check_block`: hash recompute, PoW difficulty or PoS proposer-selection + quorum + every signature) against its own stored tip before adopting it — not just a shallow linkage check. The "Nodes" panel in the Consensus arena shows each node's height/hash and whether it is in sync — and the tamper demo can corrupt one node's mirror on demand to show it falling out of sync until explicitly resynced.
+* `GET /api/events` merges sealed/rejected rounds, slashing events and matured rewards into one chronological "bitácora", shown in the Consensus arena.
 
 ## What the reviewer signs
 
@@ -40,14 +48,15 @@ v1|work_item_id|work_hash|artifact_type|score|rules_hash|decision|sha256(comment
 ```
 
 * `tx_id = sha256(canonical | signature)`.
-* Blocks commit to their transactions through a Bitcoin-style merkle root.
-* A block's hash is the double SHA-256 of its header: `v1|height|prev_hash|merkle_root|timestamp_ms|difficulty_bits|miner|nonce`.
+* Blocks commit to their transactions through a Bitcoin-style merkle root (an enhancement over the guide's plain field list), and must contain **at least one transaction** — an empty mempool is rejected before a round even starts, with a clear message.
+* A block's hash is the double SHA-256 of its header: `v1|height|prev_hash|merkle_root|timestamp_ms|proposer|nonce|difficulty_hex_zeros` (`nonce`/`difficulty_hex_zeros` are 0 for PoS blocks).
 
 `GET /api/chain/verify` checks the whole chain from genesis:
 
 * every block hash, and that each block links to the previous one
-* the proof-of-work
-* that each miner is registered, and each miner's signature
+* PoW blocks: the hash meets the stored hex-zero-digit difficulty
+* PoS blocks: that the proposer was the legitimate stake-weighted selection for that height (replaying the sorteo over the stake snapshot frozen at round time), that the recorded votes reach the ≥ 2/3 stake quorum, and that each vote's signature is valid
+* the proposer's own signature over the block hash
 * the merkle roots and the tx_ids
 * each auditor's signature and fingerprint
 * the comment hashes
@@ -66,7 +75,7 @@ cp .env.example .env        # then edit PGUSER / PGPASSWORD / PGDATABASE ...
 cd backend
 cmake -G Ninja -B build
 cmake --build build
-./build/ledger_selftest.exe # checks crypto, merkle, PoW and the rules engine
+./build/ledger_selftest.exe # checks crypto, merkle, proposer selection, quorum math and the rules engine
 ./build/ledger_server.exe   # creates the DB if missing, applies db/schema.sql, creates genesis
 
 # 4. Frontend (in another terminal)
@@ -78,23 +87,26 @@ npm run dev                 # open http://localhost:5173 (it proxies /api to :80
 * `C:\msys64\ucrt64\bin` must be on your `PATH` when you run the server, because it needs the OpenSSL and libpq DLLs.
 * On Linux or macOS, install OpenSSL 3, libpq, CMake and Ninja with your package manager. The rest of the steps are the same.
 * **Single-server mode:** run `npm run build`. The C++ node then serves `frontend/dist` itself at `http://127.0.0.1:8080`.
+* **Upgrading from a pre-PoS database:** the schema has no migrations (`CREATE TABLE IF NOT EXISTS` only). If your `ai_ledger`
+  database still has the old `miners`/`mining_rounds` tables, drop the whole database (`DROP DATABASE ai_ledger;`) before
+  starting the new server, so it can recreate it from the current schema.
 
-### End-to-end test
+### Tests
 
 With the server running:
 
 ```bash
-node scripts/e2e.mjs http://127.0.0.1:8080
+node scripts/e2e.mjs http://127.0.0.1:8080   # happy-path smoke test
+node scripts/casos.mjs http://127.0.0.1:8080 # section-5 robustness cases from the guide
 ```
 
-This script **resets the demo data**. It then:
-
-1. Submits LOW, MEDIUM and HIGH work.
-2. Signs the MEDIUM item with WebCrypto.
-3. Checks that forged and LOW-confidence transactions are rejected.
-4. Mines a block with 4 miners.
-5. Verifies the chain.
-6. Runs each of the 4 tamper attacks and checks that each one is detected.
+Both scripts **reset the demo data**. `e2e.mjs`: submits LOW/MEDIUM/HIGH work, signs the MEDIUM item with WebCrypto, checks
+forged/LOW-confidence transactions are rejected, seals a PoS block with 10 nodes, runs a second round with a dishonest
+proposer (checks it still seals and the proposer gets slashed), corrupts and restores one node's local chain copy, then
+verifies the chain and runs each tamper attack. `casos.mjs` specifically drives the edge cases in section 5 of the guide: N
+out of range, invalid difficulty, empty mempool, no-stake/negative-stake, a round already running, and mining ≥10 PoW blocks
+in a row to watch a reward mature at height+6. `backend/build/ledger_selftest.exe` covers the pure math (nonce-partition
+uniqueness, the quorum-threshold lemma, redraw termination) without needing Postgres at all.
 
 ## Try it out in the UI
 
@@ -104,7 +116,13 @@ This script **resets the demo data**. It then:
    * Select the item and click **Download & verify SHA-256**.
    * Approve it, then sign.
 3. **Mempool.** The transaction shows up here, with its signature re-verified by C++.
-4. **Mining arena.** Choose the number of miners and the difficulty, then start a round. The live stream shows each miner's hashrate, and the winner and stale miners are highlighted.
+4. **Consensus arena.** Pick **V1 · Proof of Work** or **V2 · Proof of Stake**, choose the node count (10–20) and the
+   mode-specific parameter (hex-zero difficulty, or how many validators to simulate as non-responsive), then start a round.
+   * PoW: watch each miner's nonce/attempts/last hash live; the winner seals the block.
+   * PoS: watch the sorteo pick a proposer and validators vote; mark a node **dishonest** in the "Nodes & stake" table first to
+     see it get rejected, slashed, and the sorteo redraw with the rest.
+   * The "Nodes (copias de la cadena)" panel shows every node's height/hash and sync status; the "Recompensas PoW" panel
+     shows pending vs. confirmed rewards.
 5. **Chain:**
    * Click **Verify chain**.
    * Use a tamper button, then click **Verify chain** again to see which block breaks and why.
@@ -120,20 +138,24 @@ This script **resets the demo data**. It then:
 ## Project layout
 
 ```
-backend/src/crypto.*      SHA-256, ECDSA P-256 (raw r||s <-> DER), base64, midstate PoW hasher
-backend/src/chain.*       canonical tx format, merkle root, block header hashing, genesis
+backend/src/crypto.*      SHA-256, ECDSA P-256 (raw r||s <-> DER), base64
+backend/src/chain.*       canonical tx format, merkle root, block header hashing, genesis, sorteo, quorum math
 backend/src/confidence.*  rules engine (LOW / MEDIUM / HIGH)
-backend/src/ledger.*      Postgres-backed chain: tip, mempool, block validation, commit, full verify
-backend/src/miner.*       N-thread mining race coordinator
+backend/src/ledger.*      Postgres-backed chain: tip, mempool, node/stake state, block validation, commit, reward maturity, full verify
+backend/src/consensus.*   PoW mining coordinator + PoS sorteo/vote/slash/redraw coordinator (one round at a time, either mode)
+backend/src/network.*     per-node in-memory chain mirrors: broadcast, independent validation, tamper/resync
 backend/src/api.*         REST + Server-Sent Events
 db/schema.sql             PostgreSQL schema (applied automatically)
-frontend/src/tabs/        Agent simulator, Auditor, Mempool, Mining arena, Chain explorer
-scripts/e2e.mjs           end-to-end test
+frontend/src/tabs/        Agent simulator, Auditor, Mempool, Consensus arena (PoW+PoS), Chain explorer
+scripts/e2e.mjs           happy-path end-to-end test
+scripts/casos.mjs         section-5 robustness/edge-case coverage
+report/reporte.tex        4-page academic report: math behind every design decision
 ```
 
 ## Known limitations (demo scope)
 
-* Miner private keys are stored in Postgres so the demo can create N miners on demand. In production, each miner node keeps its own key, ideally in an HSM.
-* All miners are threads inside a single process. There is no P2P networking and no fork resolution beyond "first valid block wins".
+* Node private keys are stored in Postgres so the demo can create N nodes on demand. In production, each node keeps its own key, ideally in an HSM.
+* All nodes are threads/mirrors inside a single process; PoW hashing and PoS votes are real, but there is no real network — "broadcast" is an in-process function call, and per-node chain mirrors store only (height, hash), not full history.
+* No balances, transfers or double-spend: stake and rewards are internal counters by design (see `report/reporte.tex`), not a currency.
 * Timestamps come from the reviewer's clock, checked to within ±5 minutes of the node's clock. For legally strong timestamps, add RFC 3161 or anchor the chain periodically to a public chain.
 * HIGH-confidence work is auto-accepted and never appears on the chain. If the business needs accountability for it too, commit a periodic merkle root of those decisions to the chain.

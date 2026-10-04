@@ -102,27 +102,6 @@ bool base64_decode(const std::string& in, Bytes& out) {
     return true;
 }
 
-int leading_zero_bits(const unsigned char* d, size_t n) {
-    int bits = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (d[i] == 0) {
-            bits += 8;
-            continue;
-        }
-        for (int b = 7; b >= 0; --b) {
-            if (d[i] & (1u << b)) return bits;
-            ++bits;
-        }
-    }
-    return bits;
-}
-
-int leading_zero_bits_hex(const std::string& hex) {
-    Bytes b;
-    if (!from_hex(hex, b)) return -1;
-    return leading_zero_bits(b.data(), b.size());
-}
-
 KeyPair generate_p256() {
     PkeyPtr pkey(EVP_EC_gen("P-256"));
     if (!pkey) throw std::runtime_error("EC key generation failed");
@@ -205,37 +184,6 @@ bool is_p256_spki(const std::string& spki_b64) {
     if (EVP_PKEY_get_utf8_string_param(pkey.get(), "group", group, sizeof(group), &glen) != 1) return false;
     std::string g(group, glen);
     return g == "prime256v1" || g == "P-256";
-}
-
-MidstateHasher::MidstateHasher(const std::string& prefix) {
-    EVP_MD* md = EVP_MD_fetch(nullptr, "SHA256", nullptr);
-    md_ = md;
-    auto* base = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(base, md, nullptr);
-    EVP_DigestUpdate(base, prefix.data(), prefix.size());
-    base_ = base;
-    work_ = EVP_MD_CTX_new();
-    outer_ = EVP_MD_CTX_new();
-}
-
-MidstateHasher::~MidstateHasher() {
-    EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(outer_));
-    EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(work_));
-    EVP_MD_CTX_free(static_cast<EVP_MD_CTX*>(base_));
-    EVP_MD_free(static_cast<EVP_MD*>(md_));
-}
-
-void MidstateHasher::hash(const char* suffix, size_t len, unsigned char out[32]) {
-    auto* work = static_cast<EVP_MD_CTX*>(work_);
-    auto* outer = static_cast<EVP_MD_CTX*>(outer_);
-    unsigned char first[32];
-    unsigned int n = 0;
-    EVP_MD_CTX_copy_ex(work, static_cast<EVP_MD_CTX*>(base_));
-    EVP_DigestUpdate(work, suffix, len);
-    EVP_DigestFinal_ex(work, first, &n);
-    EVP_DigestInit_ex(outer, static_cast<EVP_MD*>(md_), nullptr);
-    EVP_DigestUpdate(outer, first, 32);
-    EVP_DigestFinal_ex(outer, out, &n);
 }
 
 }  // namespace crypto

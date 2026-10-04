@@ -1,8 +1,9 @@
 #pragma once
 #include "confidence.h"
+#include "consensus.h"
 #include "db.h"
 #include "ledger.h"
-#include "miner.h"
+#include "network.h"
 
 namespace httplib {
 class Server;
@@ -11,11 +12,11 @@ class Server;
 struct AppContext {
     Db& db;
     Ledger& ledger;
+    ConsensusCoordinator& consensus;
+    NodeNetwork& network;
     RulesEngine& rules;
-    MiningCoordinator& miner;
-    int default_difficulty;
+    int64_t initial_stake;
     int max_tx_per_block;
-    int max_miners;
     int64_t timestamp_skew_ms;
 };
 

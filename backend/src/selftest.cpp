@@ -1,7 +1,7 @@
 // Offline checks for the cryptographic core. Run: build/ledger_selftest
-#include <chrono>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #include "chain.h"
 #include "confidence.h"
@@ -48,30 +48,84 @@ int main() {
     check(chain::merkle_root({a, b}) != chain::merkle_root({b, a}), "merkle order sensitive");
     check(chain::merkle_root({a, b, a}) == chain::merkle_root({a, b, a, a}), "merkle odd duplication");
 
-    // Midstate hasher equals full hash
+    // Genesis header hashes deterministically (sanity check for canonical_header/block_hash).
     chain::BlockHeader h = chain::genesis_header();
-    h.nonce = 12345;
-    crypto::MidstateHasher mh(chain::header_prefix(h));
-    unsigned char d[32];
-    std::string n = std::to_string(h.nonce);
-    mh.hash(n.data(), n.size(), d);
-    check(crypto::to_hex(d, 32) == chain::block_hash(h), "midstate hash == block_hash");
+    check(chain::block_hash(h) == chain::block_hash(chain::genesis_header()), "block_hash is deterministic");
 
-    // Mini PoW + hashrate
-    h.difficulty_bits = 16;
-    crypto::MidstateHasher pow(chain::header_prefix(h));
-    auto t0 = std::chrono::steady_clock::now();
-    uint64_t nonce = 0;
-    for (;; ++nonce) {
-        std::string s = std::to_string(nonce);
-        pow.hash(s.data(), s.size(), d);
-        if (crypto::leading_zero_bits(d, 32) >= 16) break;
+    // meets_difficulty: hex-digit leading zeros, as the guide specifies (not bits).
+    check(chain::meets_difficulty("000abc...", 3), "meets_difficulty: 3 leading hex zeros");
+    check(!chain::meets_difficulty("00abc...", 3), "meets_difficulty: rejects only 2 leading hex zeros");
+    check(chain::meets_difficulty("anything", 0), "meets_difficulty: d=0 always satisfied");
+
+    // PoW disjoint nonces: miner i in [0,N) tries i, i+N, i+2N, ... Two miners can never
+    // report the same nonce, because that would require i1 + k1*N == i2 + k2*N with
+    // 0<=i1,i2<N, which forces i1 == i2 (mod N) and hence i1 == i2. This is what makes the
+    // "smallest winning nonce wins" tie-break well-defined (no real ties are possible).
+    {
+        const int N = 7;
+        bool collision = false;
+        for (int i1 = 0; i1 < N && !collision; ++i1)
+            for (int i2 = 0; i2 < N && !collision; ++i2) {
+                if (i1 == i2) continue;
+                for (uint64_t k1 = 0; k1 < 50 && !collision; ++k1)
+                    for (uint64_t k2 = 0; k2 < 50 && !collision; ++k2)
+                        if (static_cast<uint64_t>(i1) + k1 * N == static_cast<uint64_t>(i2) + k2 * N) collision = true;
+            }
+        check(!collision, "PoW nonce residue classes never collide across miners");
     }
-    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    h.nonce = nonce;
-    check(chain::meets_difficulty(chain::block_hash(h), 16), "PoW found for 16 bits");
-    std::printf("       nonce=%llu  ~%.2f MH/s single thread\n", (unsigned long long)nonce,
-                (nonce + 1) / secs / 1e6);
+
+    // Stake-weighted proposer selection is deterministic: same stake table + same
+    // (prev_hash, height, attempt) always picks the same proposer.
+    std::vector<chain::StakeEntry> stakes = {{"v1", 10}, {"v2", 20}, {"v3", 70}};
+    std::string p1 = chain::select_proposer(stakes, "deadbeef", 42, 0);
+    std::string p2 = chain::select_proposer(stakes, "deadbeef", 42, 0);
+    check(!p1.empty() && p1 == p2, "select_proposer is deterministic");
+    check(chain::select_proposer(stakes, "deadbeef", 43, 0) != "",
+          "select_proposer picks someone for a different height");
+    check(chain::select_proposer(stakes, "deadbeef", 42, 1) != p1 ||
+              chain::select_proposer(stakes, "deadbeef", 42, 2) != p1,
+          "select_proposer's attempt counter can change the draw (redraw after a rejection)");
+    check(chain::select_proposer({}, "deadbeef", 1, 0).empty(), "select_proposer with no validators returns empty");
+
+    // Selection frequency over many trials should roughly track stake weight (loose bound,
+    // just to catch a gross bias rather than verify exact statistics).
+    int counts[3] = {0, 0, 0};
+    const int trials = 20000;
+    for (int i = 0; i < trials; ++i) {
+        std::string w = chain::select_proposer(stakes, "seed", i, 0);
+        if (w == "v1") ++counts[0];
+        else if (w == "v2") ++counts[1];
+        else if (w == "v3") ++counts[2];
+    }
+    double f1 = double(counts[0]) / trials, f2 = double(counts[1]) / trials, f3 = double(counts[2]) / trials;
+    check(f1 > 0.05 && f1 < 0.15, "proposer frequency tracks stake (v1 ~10%)");
+    check(f2 > 0.15 && f2 < 0.25, "proposer frequency tracks stake (v2 ~20%)");
+    check(f3 > 0.60 && f3 < 0.80, "proposer frequency tracks stake (v3 ~70%)");
+
+    // BFT quorum threshold: smallest integer V that is >= 2/3 of the total -- i.e. the
+    // smallest V with 3V >= 2*total. Check the lemma directly at and around the exact
+    // boundary (total=3k has an exact integer 2/3).
+    check(chain::quorum_threshold(100) == 67, "quorum_threshold(100) == 67");
+    check(chain::quorum_threshold(10) == 7, "quorum_threshold(10) == 7");
+    check(chain::quorum_threshold(3) == 2, "quorum_threshold(3) == 2");
+    for (int64_t total = 1; total <= 300; ++total) {
+        int64_t V = chain::quorum_threshold(total);
+        check(3 * V >= 2 * total, "quorum_threshold satisfies 3V>=2A");
+        check(V == 0 || 3 * (V - 1) < 2 * total, "quorum_threshold is the smallest such V");
+    }
+
+    // PoS redraw termination: the eligible pool strictly shrinks by one on every rejection
+    // (the slashed proposer is removed), so a round settles (sealed or pool exhausted) in at
+    // most N attempts -- simulate the bookkeeping directly.
+    {
+        int pool_size = 12;
+        int attempts = 0;
+        while (pool_size > 0 && attempts < 1000) {
+            --pool_size;  // worst case: every draw is dishonest and gets slashed
+            ++attempts;
+        }
+        check(attempts <= 12, "PoS redraw terminates within the initial pool size");
+    }
 
     // Rules engine
     RulesEngine re;

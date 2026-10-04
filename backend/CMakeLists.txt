@@ -4,7 +4,7 @@ project(ai_agent_ledger CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)  # PoW loop needs optimisation
+  set(CMAKE_BUILD_TYPE Release)
 endif()
 
 find_package(OpenSSL 3 REQUIRED)
@@ -24,7 +24,8 @@ add_executable(ledger_server
   src/main.cpp
   src/db.cpp
   src/ledger.cpp
-  src/miner.cpp
+  src/network.cpp
+  src/consensus.cpp
   src/api.cpp)
 target_link_libraries(ledger_server PRIVATE ledger_core PostgreSQL::PostgreSQL)
 

@@ -34,22 +34,47 @@ std::string tx_id(const std::string& canonical, const std::string& sig_hex);
 std::string merkle_root(const std::vector<std::string>& leaf_hex);
 
 // ---------- Blocks ----------
+// Shared by both consensus modes: PoW leaves proposer/votes empty-ish (quorum=total=0) and
+// uses nonce/difficulty_hex_zeros; PoS leaves nonce=0, difficulty_hex_zeros=0 and uses
+// proposer + the quorum fields (tracked alongside, in BlockRow/votes, not in the header
+// itself). nonce and difficulty_hex_zeros DO live in the header because the guide requires
+// the block hash to cover them regardless of mode.
 struct BlockHeader {
     int64_t height = 0;
     std::string prev_hash;
     std::string merkle_root;
     int64_t timestamp_ms = 0;
-    int difficulty_bits = 0;
-    std::string miner;  // registered miner name; distinct per miner so each searches its own space
-    uint64_t nonce = 0;
+    std::string proposer;          // winning miner (PoW) or sorteed validator (PoS)
+    uint64_t nonce = 0;             // PoW: winning nonce. PoS: always 0.
+    int difficulty_hex_zeros = 0;   // PoW: required leading hex zero digits. PoS: always 0.
 };
 
-// Everything except the nonce, so the PoW loop can hash it once (midstate).
-std::string header_prefix(const BlockHeader& h);
+std::string canonical_header(const BlockHeader& h);
 std::string block_hash(const BlockHeader& h);
-bool meets_difficulty(const std::string& hash_hex, int bits);
+
+// True iff hash_hex starts with `hex_zeros` '0' characters (PoW target, in hex digits as the
+// guide specifies -- not bits).
+bool meets_difficulty(const std::string& hash_hex, int hex_zeros);
 
 extern const char* kZeroHash;
 BlockHeader genesis_header();
+
+// ---------- Proof-of-stake selection ----------
+struct StakeEntry {
+    std::string name;
+    int64_t stake = 0;
+};
+
+// Deterministic, stake-weighted leader election ("sorteo"): seeds on (prev_hash, height,
+// attempt) so anyone who knows the same stake table can recompute the same proposer, with no
+// coordinator and no computation race. `attempt` starts at 0 and increments on every redraw
+// after a rejected proposal, so a redraw never repeats the same draw. Returns "" if the stake
+// table is empty or totals zero stake.
+std::string select_proposer(const std::vector<StakeEntry>& stakes, const std::string& prev_hash, int64_t height,
+                            int attempt);
+
+// Smallest integer V that is >= 2/3 of total_stake (the BFT quorum requirement): the smallest
+// V with 3V >= 2*total_stake.
+int64_t quorum_threshold(int64_t total_stake);
 
 }  // namespace chain

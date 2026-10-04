@@ -2,7 +2,7 @@ import { Fragment, useState } from 'react';
 import { api } from '../api';
 import { Badge, Canonical, ErrorBox, Hash, fmtTime, usePoll } from '../components/ui';
 
-export default function Mempool({ onGoMining }: { onGoMining: () => void }) {
+export default function Mempool({ onGoConsensus }: { onGoConsensus: () => void }) {
   const [txs, err] = usePoll(api.mempool, 2000);
   const [open, setOpen] = useState<string | null>(null);
 
@@ -13,11 +13,11 @@ export default function Mempool({ onGoMining }: { onGoMining: () => void }) {
           <h2>Mempool — signed, not yet sealed</h2>
           <p className="hint">
             Each transaction was re-verified by the C++ node (ECDSA P-256 over the canonical payload). It becomes immutable once a
-            miner seals it into a block.
+            validator quorum seals it into a block.
           </p>
         </div>
-        <button className="btn primary" onClick={onGoMining} disabled={!txs?.length}>
-          Mine these →
+        <button className="btn primary" onClick={onGoConsensus} disabled={!txs?.length}>
+          Propose these →
         </button>
       </div>
       <ErrorBox error={err} />

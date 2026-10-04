@@ -2,3 +2,6 @@
 backend/build/
 frontend/node_modules/
 frontend/dist/
+*.tsbuildinfo
+backend/srv.log
+backend/srv.err

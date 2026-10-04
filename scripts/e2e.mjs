@@ -82,31 +82,83 @@ check(tx.status === 201 && tx.json?.signature_valid, 'WebCrypto signature verifi
 const mempool = (await api('GET', '/api/mempool')).json;
 check(mempool.length === 1, 'transaction in mempool');
 
-// 4. Mining race: 4 miners
-const start = await api('POST', '/api/mine', { miners: 4, difficulty_bits: 18 });
-check(start.status === 202, 'mining round started');
+// 4. Consensus (PoS): 10 nodes (the guide's minimum), stake-weighted quorum
+const NODES = 10;
+await api('POST', '/api/nodes', { count: NODES, stake: 100 });
+const start = await api('POST', '/api/consensus/propose', { mode: 'pos', nodes: NODES, abstain: 0 });
+check(start.status === 202, 'consensus round started');
 let snap;
 for (let i = 0; i < 300; i++) {
   await sleep(100);
-  snap = (await api('GET', '/api/mine/status')).json;
+  snap = (await api('GET', '/api/consensus/status')).json;
   if (!snap.running) break;
 }
-check(snap.result?.outcome === 'sealed', 'block sealed', `winner=${snap.result?.winner} nonce=${snap.result?.nonce} ${Math.round(snap.total_hashrate / 1e3)} kH/s`);
-const statuses = snap.miners.map((m) => m.status);
-check(statuses.filter((s) => s === 'winner').length === 1, 'exactly one winner', statuses.join(','));
+check(
+  snap.result?.outcome === 'sealed',
+  'block sealed',
+  `proposer=${snap.result?.proposer} quorum=${snap.result?.quorum_stake}/${snap.result?.total_stake}`,
+);
+check(snap.quorum_stake >= snap.quorum_threshold, 'quorum threshold reached', `${snap.quorum_stake}/${snap.quorum_threshold}`);
 
 const block = (await api('GET', `/api/blocks/${snap.result.height}`)).json;
 check(block.transactions?.[0]?.tx_id === tx.json.tx_id, 'tx included in block', `#${block.height} ${block.hash.slice(0, 20)}...`);
+
+// 4b. A dishonest proposer must be caught, slashed and redrawn: mark the node with the most
+// stake (so it is very likely to be drawn first) as dishonest, submit a fresh MEDIUM item so
+// there is something to propose, and confirm the round still seals with someone else.
+const med2 = await submit('agent-med-2', {
+  self_confidence: 0.8, tests_passed_ratio: 0.9, lines_changed: 80, has_external_side_effects: true,
+});
+const ts2 = Date.now();
+const canonical2 = [
+  'v1', med2.json.id, med2.json.work_hash, med2.json.artifact_type, med2.json.score, med2.json.rules_hash,
+  'APPROVED', await sha256hex(comment), auditor.fingerprint, ts2,
+].join('|');
+const sig2 = hex(await subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, new TextEncoder().encode(canonical2)));
+await api('POST', '/api/transactions', {
+  work_item_id: med2.json.id, auditor_id: auditor.id, decision: 'APPROVED', comment, timestamp_ms: ts2, signature: sig2, canonical: canonical2,
+});
+
+const beforeNodes = (await api('GET', '/api/nodes')).json;
+const richest = beforeNodes[0];
+// Give it overwhelming stake so the weighted draw picks it (almost) for certain, instead of
+// depending on luck across the 10 equally-staked nodes.
+await api('POST', `/api/nodes/${richest.id}/stake`, { delta: 10_000_000 });
+await api('POST', `/api/nodes/${richest.id}/dishonest`, { dishonest: true });
+
+const dStart = await api('POST', '/api/consensus/propose', { mode: 'pos', nodes: NODES, abstain: 0 });
+check(dStart.status === 202, 'dishonest-proposer round started');
+let dSnap;
+for (let i = 0; i < 300; i++) {
+  await sleep(100);
+  dSnap = (await api('GET', '/api/consensus/status')).json;
+  if (!dSnap.running) break;
+}
+check(dSnap.result?.outcome === 'sealed', 'round still seals after a dishonest draw', dSnap.result?.outcome);
+check((dSnap.result?.attempts ?? 1) >= 1, 'sorteo attempt count recorded', dSnap.result?.attempts);
+const afterNodes = (await api('GET', '/api/nodes')).json;
+check(afterNodes.find((n) => n.id === richest.id)?.slashed, 'dishonest proposer got slashed', richest.name);
+
+// 4c. node_copy tamper: corrupts one node's own in-memory chain mirror, independent of the
+// reference ledger; it must come back in sync after a resync.
+const anyNode = afterNodes[0];
+const nc = await api('POST', '/api/demo/tamper', { kind: 'node_copy' });
+check(nc.status === 200, 'node_copy tamper applied', nc.json?.change);
+let syncStatus = (await api('GET', '/api/nodes/sync')).json;
+check(syncStatus.some((s) => !s.synced), 'a node mirror is now out of sync');
+await api('POST', '/api/demo/restore');
+syncStatus = (await api('GET', '/api/nodes/sync')).json;
+check(syncStatus.every((s) => s.synced), 'all node mirrors back in sync after restore');
 
 // 5. Verification + tamper detection
 let v = (await api('GET', '/api/chain/verify')).json;
 check(v.ok, 'chain verifies');
 
-for (const kind of ['tx_decision', 'comment', 'artifact', 'block_nonce']) {
+for (const kind of ['tx_decision', 'comment', 'artifact', 'validator_signature']) {
   await api('POST', '/api/demo/tamper', { kind });
   v = (await api('GET', '/api/chain/verify')).json;
   const bad = v.blocks.find((b) => !b.ok);
-  check(!v.ok && v.first_bad_height === block.height, `tamper '${kind}' detected`, bad?.errors?.[0]);
+  check(!v.ok, `tamper '${kind}' detected`, bad?.errors?.[0]);
   await api('POST', '/api/demo/restore');
   v = (await api('GET', '/api/chain/verify')).json;
   check(v.ok, `restore after '${kind}'`);

@@ -71,20 +71,22 @@ std::string merkle_root(const std::vector<std::string>& leaf_hex) {
     return crypto::to_hex(level[0]);
 }
 
-std::string header_prefix(const BlockHeader& h) {
+std::string canonical_header(const BlockHeader& h) {
     std::ostringstream o;
     o << "v1|" << h.height << '|' << h.prev_hash << '|' << h.merkle_root << '|' << h.timestamp_ms << '|'
-      << h.difficulty_bits << '|' << h.miner << '|';
+      << h.proposer << '|' << h.nonce << '|' << h.difficulty_hex_zeros;
     return o.str();
 }
 
 std::string block_hash(const BlockHeader& h) {
-    std::string data = header_prefix(h) + std::to_string(h.nonce);
+    std::string data = canonical_header(h);
     return crypto::to_hex(crypto::sha256d(data.data(), data.size()));
 }
 
-bool meets_difficulty(const std::string& hash_hex, int bits) {
-    return crypto::leading_zero_bits_hex(hash_hex) >= bits;
+bool meets_difficulty(const std::string& hash_hex, int hex_zeros) {
+    if (hex_zeros <= 0) return true;
+    if (static_cast<int>(hash_hex.size()) < hex_zeros) return false;
+    return hash_hex.compare(0, hex_zeros, std::string(hex_zeros, '0')) == 0;
 }
 
 BlockHeader genesis_header() {
@@ -93,10 +95,35 @@ BlockHeader genesis_header() {
     g.prev_hash = kZeroHash;
     g.merkle_root = kZeroHash;
     g.timestamp_ms = 1767225600000;  // 2026-01-01T00:00:00Z
-    g.difficulty_bits = 0;
-    g.miner = "genesis";
-    g.nonce = 0;
+    g.proposer = "genesis";
     return g;
+}
+
+std::string select_proposer(const std::vector<StakeEntry>& stakes, const std::string& prev_hash, int64_t height,
+                            int attempt) {
+    int64_t total = 0;
+    for (const auto& s : stakes) total += s.stake;
+    if (stakes.empty() || total <= 0) return "";
+
+    std::ostringstream seed_in;
+    seed_in << prev_hash << '|' << height << '|' << attempt;
+    std::string seed_str = seed_in.str();
+    crypto::Bytes digest = crypto::sha256(seed_str.data(), seed_str.size());
+    uint64_t seed = 0;
+    for (int i = 0; i < 8; ++i) seed = (seed << 8) | digest[i];
+    uint64_t point = seed % static_cast<uint64_t>(total);
+
+    int64_t acc = 0;
+    for (const auto& s : stakes) {
+        acc += s.stake;
+        if (point < static_cast<uint64_t>(acc)) return s.name;
+    }
+    return stakes.back().name;  // rounding fallback, should not be reached
+}
+
+int64_t quorum_threshold(int64_t total_stake) {
+    // ceil(2 * total / 3) without floating point.
+    return (2 * total_stake + 2) / 3;
 }
 
 }  // namespace chain

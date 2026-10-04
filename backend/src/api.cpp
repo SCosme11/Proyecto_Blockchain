@@ -3,6 +3,7 @@
 #define CPPHTTPLIB_THREAD_POOL_COUNT 32
 #include <httplib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -11,6 +12,12 @@
 using nlohmann::json;
 
 namespace {
+
+// The guide fixes the valid node-count range at 10-20; it is not meant to be configurable.
+constexpr int kMinNodes = 10;
+constexpr int kMaxNodes = 20;
+constexpr int kMinDifficulty = 1;
+constexpr int kMaxDifficulty = 6;  // hex zero digits
 
 struct HttpError : std::runtime_error {
     int status;
@@ -136,12 +143,15 @@ json block_json(const BlockRow& b) {
             {"prev_hash", h.prev_hash},
             {"merkle_root", h.merkle_root},
             {"timestamp_ms", h.timestamp_ms},
-            {"difficulty_bits", h.difficulty_bits},
+            {"mode", b.mode},
             {"nonce", h.nonce},
-            {"miner", h.miner},
-            {"miner_signature", b.miner_signature},
+            {"difficulty_hex_zeros", h.difficulty_hex_zeros},
+            {"proposer", h.proposer},
+            {"proposer_signature", b.proposer_signature},
+            {"quorum_stake", b.quorum_stake},
+            {"total_stake", b.total_stake},
             {"tx_count", b.tx_count},
-            {"header_preimage", chain::header_prefix(h) + std::to_string(h.nonce)}};
+            {"header_preimage", chain::canonical_header(h)}};
 }
 
 }  // namespace
@@ -165,9 +175,14 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                            {"rules_hash", ctx.rules.hash()},
                            {"rules", ctx.rules.rules()},
                            {"tx_version", chain::kTxVersion},
-                           {"default_difficulty", ctx.default_difficulty},
+                           {"initial_stake", ctx.initial_stake},
                            {"max_tx_per_block", ctx.max_tx_per_block},
-                           {"max_miners", ctx.max_miners},
+                           {"min_nodes", kMinNodes},
+                           {"max_nodes", kMaxNodes},
+                           {"min_difficulty_hex_zeros", kMinDifficulty},
+                           {"max_difficulty_hex_zeros", kMaxDifficulty},
+                           {"quorum_numerator", 2},
+                           {"quorum_denominator", 3},
                            {"timestamp_skew_ms", ctx.timestamp_skew_ms}});
             }));
 
@@ -183,12 +198,14 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                     "(SELECT count(*) FROM transactions WHERE status='confirmed') AS confirmed,"
                     "(SELECT max(height) FROM blocks) AS height,"
                     "(SELECT count(*) FROM auditors) AS auditors,"
-                    "(SELECT count(*) FROM miners) AS miners");
+                    "(SELECT count(*) FROM nodes) AS nodes");
                 json j;
                 for (const char* k : {"work_total", "low", "medium", "high", "pending_review", "mempool", "confirmed",
-                                      "height", "auditors", "miners"})
+                                      "height", "auditors", "nodes"})
                     j[k] = r.i64(0, k);
-                j["mining"] = ctx.miner.running();
+                j["consensus_running"] = ctx.consensus.running();
+                j["consensus_mode"] = ctx.consensus.running() ? ctx.consensus.snapshot().value("mode", "") : "";
+                j["total_stake"] = ctx.ledger.total_active_stake();
                 send(res, j);
             }));
 
@@ -379,58 +396,184 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                 send(res, tx_json(r, 0, true));
             }));
 
-    // ---------------- miners & mining ----------------
-    auto miners_json = [&]() {
-        Result r = db.exec("SELECT id, name, public_key_spki, blocks_mined FROM miners ORDER BY name");
+    // ---------------- nodes & consensus ----------------
+    auto nodes_json = [&]() {
+        Result r = db.exec("SELECT id, name, public_key_spki, stake, active, slashed, dishonest, blocks_proposed "
+                           "FROM nodes ORDER BY name");
         json arr = json::array();
         for (int i = 0; i < r.rows(); ++i)
             arr.push_back({{"id", r.i64(i, "id")},
                            {"name", r.str(i, "name")},
                            {"fingerprint", crypto::fingerprint(r.str(i, "public_key_spki"))},
-                           {"blocks_mined", r.i64(i, "blocks_mined")}});
+                           {"stake", r.i64(i, "stake")},
+                           {"active", r.str(i, "active") == "t"},
+                           {"slashed", r.str(i, "slashed") == "t"},
+                           {"dishonest", r.str(i, "dishonest") == "t"},
+                           {"blocks_proposed", r.i64(i, "blocks_proposed")}});
         return arr;
     };
 
-    svr.Get("/api/miners", wrap([miners_json](const httplib::Request&, httplib::Response& res) { send(res, miners_json()); }));
+    svr.Get("/api/nodes",
+            wrap([nodes_json](const httplib::Request&, httplib::Response& res) { send(res, nodes_json()); }));
 
-    svr.Post("/api/miners", wrap([&, miners_json](const httplib::Request& req, httplib::Response& res) {
-                 int n = body(req).value("count", 4);
-                 if (n < 1 || n > ctx.max_miners) throw HttpError(400, "count out of range");
-                 ctx.ledger.ensure_miners(n);
-                 send(res, miners_json(), 201);
-             }));
-
-    svr.Post("/api/mine", wrap([&](const httplib::Request& req, httplib::Response& res) {
+    // "El número de nodos N se elige en la interfaz y debe cumplir 10 <= N <= 20".
+    svr.Post("/api/nodes", wrap([&, nodes_json](const httplib::Request& req, httplib::Response& res) {
                  json b = body(req);
-                 int n = b.value("miners", 4);
-                 int bits = b.value("difficulty_bits", ctx.default_difficulty);
-                 if (n < 1 || n > ctx.max_miners)
-                     throw HttpError(400, "miners must be 1-" + std::to_string(ctx.max_miners));
-                 if (bits < 1 || bits > 32) throw HttpError(400, "difficulty_bits must be 1-32");
-                 std::string err;
-                 if (!ctx.miner.start(n, bits, err)) throw HttpError(409, err);
-                 send(res, ctx.miner.snapshot(), 202);
+                 int n = b.value("count", kMinNodes);
+                 int64_t stake = b.value("stake", ctx.initial_stake);
+                 if (n < kMinNodes || n > kMaxNodes)
+                     throw HttpError(400, "count must be between " + std::to_string(kMinNodes) + " and " +
+                                              std::to_string(kMaxNodes));
+                 if (stake < 0) throw HttpError(400, "stake must be >= 0");
+                 ctx.ledger.ensure_nodes(n, stake);
+                 send(res, nodes_json(), 201);
              }));
 
-    svr.Post("/api/mine/stop", wrap([&](const httplib::Request&, httplib::Response& res) {
-                 ctx.miner.stop();
+    svr.Post(R"(/api/nodes/(\d+)/stake)", wrap([&, nodes_json](const httplib::Request& req, httplib::Response& res) {
+                 int id = std::stoi(std::string(req.matches[1]));
+                 int64_t delta = field<int64_t>(body(req), "delta");
+                 std::string err;
+                 if (!ctx.ledger.adjust_stake(id, delta, err)) {
+                     throw HttpError(err == "node not found" ? 404 : 409, err);
+                 }
+                 send(res, nodes_json());
+             }));
+
+    svr.Post(R"(/api/nodes/(\d+)/dishonest)", wrap([&, nodes_json](const httplib::Request& req, httplib::Response& res) {
+                 int id = std::stoi(std::string(req.matches[1]));
+                 bool dishonest = body(req).value("dishonest", true);
+                 std::string err;
+                 if (!ctx.ledger.set_dishonest(id, dishonest, err)) throw HttpError(404, err);
+                 send(res, nodes_json());
+             }));
+
+    svr.Get("/api/nodes/sync", wrap([&](const httplib::Request&, httplib::Response& res) {
+                BlockRow tip = ctx.ledger.tip();
+                send(res, ctx.network.status(tip.header.height, tip.hash));
+            }));
+
+    svr.Post(R"(/api/nodes/(\d+)/resync)", wrap([&](const httplib::Request& req, httplib::Response& res) {
+                 int id = std::stoi(std::string(req.matches[1]));
+                 BlockRow tip = ctx.ledger.tip();
+                 std::string err;
+                 if (!ctx.network.resync(id, tip.header.height, tip.hash, err)) throw HttpError(404, err);
+                 send(res, ctx.network.status(tip.header.height, tip.hash));
+             }));
+
+    svr.Get("/api/rewards", wrap([&](const httplib::Request&, httplib::Response& res) {
+                json arr = json::array();
+                for (const auto& w : ctx.ledger.rewards())
+                    arr.push_back({{"height", w.height}, {"miner", w.miner_name}, {"confirmed", w.confirmed}});
+                send(res, arr);
+            }));
+
+    // Unified "bitácora": bloque minado/sellado, ronda rechazada, castigo (slashing) y
+    // recompensa acreditada, mezclados y ordenados del más reciente al más antiguo -- lo que
+    // pide la sección 6 de la guía ("Registren eventos... en una bitácora visible").
+    svr.Get("/api/events", wrap([&](const httplib::Request& req, httplib::Response& res) {
+                int limit = 50;
+                try {
+                    if (!req.get_param_value("limit").empty()) limit = std::stoi(req.get_param_value("limit"));
+                } catch (...) {
+                }
+                auto ts_expr = [](const char* col) {
+                    return std::string("to_char(") + col + " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')";
+                };
+
+                std::vector<json> events;
+
+                Result rounds = db.exec(
+                    std::string("SELECT mode, attempt, proposer, block_height, outcome, ") + ts_expr("created_at") +
+                    " AS ts FROM consensus_rounds ORDER BY id DESC LIMIT 200");
+                for (int i = 0; i < rounds.rows(); ++i) {
+                    std::string outcome = rounds.str(i, "outcome");
+                    std::string mode = rounds.str(i, "mode");
+                    std::string proposer = rounds.is_null(i, "proposer") ? "?" : rounds.str(i, "proposer");
+                    std::string msg;
+                    if (outcome == "sealed") {
+                        msg = (mode == "pow" ? "Bloque minado (PoW) #" : "Bloque sellado (PoS) #") +
+                              rounds.str(i, "block_height") + " por " + proposer;
+                    } else {
+                        msg = "Ronda " + mode + " rechazada (" + outcome + "), proponente " + proposer;
+                    }
+                    events.push_back({{"type", outcome == "sealed" ? "block" : "round_rejected"},
+                                      {"message", msg},
+                                      {"created_at", rounds.str(i, "ts")}});
+                }
+
+                Result slashes = db.exec(
+                    std::string("SELECT n.name, se.reason, se.stake_before, se.stake_after, se.block_height, ") +
+                    ts_expr("se.created_at") +
+                    " AS ts FROM slashing_events se JOIN nodes n ON n.id = se.validator_id ORDER BY se.id DESC LIMIT 200");
+                for (int i = 0; i < slashes.rows(); ++i) {
+                    std::string msg = "Castigo a " + slashes.str(i, "name") + " (" + slashes.str(i, "reason") +
+                                      "): stake " + slashes.str(i, "stake_before") + " -> " +
+                                      slashes.str(i, "stake_after");
+                    events.push_back({{"type", "slash"}, {"message", msg}, {"created_at", slashes.str(i, "ts")}});
+                }
+
+                Result rewards = db.exec(
+                    std::string("SELECT pr.height, n.name, ") + ts_expr("pr.confirmed_at") +
+                    " AS ts FROM pow_rewards pr JOIN nodes n ON n.id = pr.miner_id "
+                    "WHERE pr.confirmed AND pr.confirmed_at IS NOT NULL ORDER BY pr.confirmed_at DESC LIMIT 200");
+                for (int i = 0; i < rewards.rows(); ++i) {
+                    std::string msg = "Recompensa acreditada a " + rewards.str(i, "name") + " por el bloque #" +
+                                      rewards.str(i, "height");
+                    events.push_back({{"type", "reward_confirmed"}, {"message", msg}, {"created_at", rewards.str(i, "ts")}});
+                }
+
+                std::sort(events.begin(), events.end(), [](const json& a, const json& b) {
+                    return a["created_at"].get<std::string>() > b["created_at"].get<std::string>();
+                });
+                if (static_cast<int>(events.size()) > limit) events.resize(limit);
+                send(res, json(events));
+            }));
+
+    svr.Post("/api/consensus/propose", wrap([&](const httplib::Request& req, httplib::Response& res) {
+                 json b = body(req);
+                 std::string mode = b.value("mode", "pos");
+                 if (mode != "pow" && mode != "pos") throw HttpError(400, "mode must be 'pow' or 'pos'");
+                 int n = b.value("nodes", kMinNodes);
+                 if (n < kMinNodes || n > kMaxNodes)
+                     throw HttpError(400, "nodes must be between " + std::to_string(kMinNodes) + " and " +
+                                              std::to_string(kMaxNodes));
+                 int difficulty = b.value("difficulty_hex_zeros", 4);
+                 if (mode == "pow" && (difficulty < kMinDifficulty || difficulty > kMaxDifficulty))
+                     throw HttpError(400, "difficulty_hex_zeros must be between " + std::to_string(kMinDifficulty) +
+                                              " and " + std::to_string(kMaxDifficulty));
+                 int abstain = b.value("abstain", 0);
+                 if (abstain < 0 || abstain > n) throw HttpError(400, "abstain must be 0-" + std::to_string(n));
+                 std::string punishment_rule = b.value("punishment_rule", "A");
+                 if (mode == "pos" && punishment_rule != "A" && punishment_rule != "B")
+                     throw HttpError(400, "punishment_rule must be 'A' or 'B'");
+                 double alpha = b.value("alpha", 1.0);
+                 if (mode == "pos" && punishment_rule == "B" && (alpha <= 0 || alpha > 1))
+                     throw HttpError(400, "alpha must satisfy 0 < alpha <= 1");
+                 std::string err;
+                 if (!ctx.consensus.start(mode, n, difficulty, abstain, punishment_rule, alpha, err))
+                     throw HttpError(409, err);
+                 send(res, ctx.consensus.snapshot(), 202);
+             }));
+
+    svr.Post("/api/consensus/stop", wrap([&](const httplib::Request&, httplib::Response& res) {
+                 ctx.consensus.stop();
                  send(res, {{"stopping", true}});
              }));
 
-    svr.Get("/api/mine/status",
-            wrap([&](const httplib::Request&, httplib::Response& res) { send(res, ctx.miner.snapshot()); }));
+    svr.Get("/api/consensus/status",
+            wrap([&](const httplib::Request&, httplib::Response& res) { send(res, ctx.consensus.snapshot()); }));
 
-    // Server-Sent Events: live mining telemetry (fast while a round runs, slow when idle).
-    svr.Get("/api/mine/stream", [&](const httplib::Request&, httplib::Response& res) {
+    // Server-Sent Events: live consensus telemetry (fast while a round runs, slow when idle).
+    svr.Get("/api/consensus/stream", [&](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache");
         res.set_header("X-Accel-Buffering", "no");
         res.set_chunked_content_provider("text/event-stream", [&](size_t, httplib::DataSink& sink) {
-            bool was_running = ctx.miner.running();
-            std::string msg = "data: " + ctx.miner.snapshot().dump() + "\n\n";
+            bool was_running = ctx.consensus.running();
+            std::string msg = "data: " + ctx.consensus.snapshot().dump() + "\n\n";
             if (!sink.write(msg.data(), msg.size())) return false;
             for (int i = 0; i < (was_running ? 2 : 10); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                if (ctx.miner.running() != was_running) break;
+                if (ctx.consensus.running() != was_running) break;
             }
             return sink.is_writable();
         });
@@ -438,18 +581,20 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
 
     svr.Get("/api/rounds", wrap([&](const httplib::Request&, httplib::Response& res) {
                 Result r = db.exec(
-                    "SELECT id, difficulty_bits, participants::text AS participants, winner, block_height, duration_ms, "
-                    "hashes_total, outcome FROM mining_rounds ORDER BY id DESC LIMIT 25");
+                    "SELECT id, mode, attempt, proposer, participants::text AS participants, block_height, "
+                    "quorum_stake, total_stake, duration_ms, outcome FROM consensus_rounds ORDER BY id DESC LIMIT 25");
                 json arr = json::array();
                 for (int i = 0; i < r.rows(); ++i)
                     arr.push_back({{"id", r.i64(i, "id")},
-                                   {"difficulty_bits", r.i64(i, "difficulty_bits")},
+                                   {"mode", r.str(i, "mode")},
+                                   {"attempt", r.i64(i, "attempt")},
+                                   {"proposer", r.is_null(i, "proposer") ? json(nullptr) : json(r.str(i, "proposer"))},
                                    {"participants", parse_json_col(r.str(i, "participants"))},
-                                   {"winner", r.is_null(i, "winner") ? json(nullptr) : json(r.str(i, "winner"))},
                                    {"block_height",
                                     r.is_null(i, "block_height") ? json(nullptr) : json(r.i64(i, "block_height"))},
+                                   {"quorum_stake", r.i64(i, "quorum_stake")},
+                                   {"total_stake", r.i64(i, "total_stake")},
                                    {"duration_ms", r.i64(i, "duration_ms")},
-                                   {"hashes_total", r.i64(i, "hashes_total")},
                                    {"outcome", r.str(i, "outcome")}});
                 send(res, arr);
             }));
@@ -471,6 +616,17 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                 json txs = json::array();
                 for (int i = 0; i < t.rows(); ++i) txs.push_back(tx_json(t, i, true));
                 j["transactions"] = txs;
+
+                Result vo = db.exec(
+                    "SELECT v.name, bv.signature, bv.stake_at_vote FROM block_votes bv "
+                    "JOIN nodes v ON v.id = bv.validator_id WHERE bv.block_height = $1 ORDER BY bv.id",
+                    {h});
+                json votes = json::array();
+                for (int i = 0; i < vo.rows(); ++i)
+                    votes.push_back({{"validator", vo.str(i, "name")},
+                                     {"signature", vo.str(i, "signature")},
+                                     {"stake", vo.i64(i, "stake_at_vote")}});
+                j["votes"] = votes;
                 send(res, j);
             }));
 
@@ -484,15 +640,46 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  std::string kind = body(req).value("kind", "tx_decision");
                  auto l = db.lock();
                  json out = {{"kind", kind}};
-                 if (kind == "block_nonce") {
-                     Result b = db.exec("SELECT height, nonce FROM blocks WHERE height > 0 ORDER BY height DESC LIMIT 1");
-                     if (b.rows() == 0) throw HttpError(409, "mine at least one block first");
+                 if (kind == "node_copy") {
+                     Result n = db.exec("SELECT id FROM nodes ORDER BY name LIMIT 1");
+                     if (n.rows() == 0) throw HttpError(409, "register at least one node first");
+                     int id = static_cast<int>(n.i64(0, "id"));
+                     std::string err;
+                     if (!ctx.network.tamper(id, err)) throw HttpError(409, err);
+                     db.exec("INSERT INTO tamper_log (kind, target) VALUES ($1,$2)", {kind, std::to_string(id)});
+                     out["target"] = "node #" + std::to_string(id) + "'s local chain copy";
+                     out["change"] = "tip hash corrupted; it will reject the next broadcast";
+                     send(res, out);
+                     return;
+                 }
+                 if (kind == "reward_amount") {
+                     Result pr = db.exec("SELECT height FROM pow_rewards WHERE confirmed ORDER BY height DESC LIMIT 1");
+                     if (pr.rows() == 0) throw HttpError(409, "no confirmed PoW reward yet");
+                     std::string h = pr.str(0, "height");
+                     db.exec("INSERT INTO tamper_log (kind, target, original_text) VALUES ($1,$2,'confirmed')",
+                             {kind, h});
+                     db.exec("UPDATE pow_rewards SET confirmed = false WHERE height = $1", {h});
+                     out["target"] = "reward for block #" + h;
+                     out["change"] = "reward confirmation flag falsified";
+                     send(res, out);
+                     return;
+                 }
+                 if (kind == "validator_signature") {
+                     Result b = db.exec(
+                         "SELECT height FROM blocks WHERE height > 0 ORDER BY height DESC LIMIT 1");
+                     if (b.rows() == 0) throw HttpError(409, "seal at least one block first");
                      std::string h = b.str(0, "height");
+                     Result v = db.exec(
+                         "SELECT id, signature FROM block_votes WHERE block_height = $1 ORDER BY id LIMIT 1", {h});
+                     if (v.rows() == 0) throw HttpError(409, "that block has no recorded votes");
+                     std::string vote_id = v.str(0, "id");
                      db.exec("INSERT INTO tamper_log (kind, target, original_text) VALUES ($1,$2,$3)",
-                             {kind, h, b.str(0, "nonce")});
-                     db.exec("UPDATE blocks SET nonce = nonce + 1 WHERE height = $1", {h});
-                     out["target"] = "block #" + h;
-                     out["change"] = "nonce incremented by 1";
+                             {kind, vote_id, v.str(0, "signature")});
+                     db.exec("UPDATE block_votes SET signature = overlay(signature placing '00' from 1 for 2) "
+                             "WHERE id = $1",
+                             {vote_id});
+                     out["target"] = "a validator's vote on block #" + h;
+                     out["change"] = "vote signature corrupted";
                      send(res, out);
                      return;
                  }
@@ -533,7 +720,9 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                      out["target"] = "artifact of work item #" + wid;
                      out["change"] = "artifact bytes modified after approval";
                  } else {
-                     throw HttpError(400, "kind must be tx_decision | comment | artifact | block_nonce");
+                     throw HttpError(400,
+                                     "kind must be tx_decision | comment | artifact | validator_signature | "
+                                     "node_copy | reward_amount");
                  }
                  send(res, out);
              }));
@@ -543,9 +732,15 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  Result r = db.exec("SELECT id, kind, target, original_text, original_bytes FROM tamper_log ORDER BY id DESC");
                  for (int i = 0; i < r.rows(); ++i) {
                      std::string kind = r.str(i, "kind"), target = r.str(i, "target");
-                     if (kind == "block_nonce") {
-                         db.exec("UPDATE blocks SET nonce = $1::bigint WHERE height = $2",
+                     if (kind == "validator_signature") {
+                         db.exec("UPDATE block_votes SET signature = $1 WHERE id = $2::bigint",
                                  {r.str(i, "original_text"), target});
+                     } else if (kind == "reward_amount") {
+                         db.exec("UPDATE pow_rewards SET confirmed = true WHERE height = $1::bigint", {target});
+                     } else if (kind == "node_copy") {
+                         BlockRow tip = ctx.ledger.tip();
+                         std::string err;
+                         ctx.network.resync(std::stoi(target), tip.header.height, tip.hash, err);
                      } else if (kind == "tx_decision") {
                          std::string c = r.str(i, "original_text");
                          chain::TxFields f;
@@ -566,16 +761,23 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
              }));
 
     svr.Post("/api/demo/reset", wrap([&](const httplib::Request&, httplib::Response& res) {
-                 if (ctx.miner.running()) throw HttpError(409, "stop the mining round first");
+                 if (ctx.consensus.running()) throw HttpError(409, "stop the consensus round first");
                  std::lock_guard<std::mutex> chain_lock(ctx.ledger.chain_mu);
                  Db::Transaction t(db);
                  db.exec("DELETE FROM tamper_log");
-                 db.exec("DELETE FROM mining_rounds");
+                 db.exec("DELETE FROM slashing_events");
+                 db.exec("DELETE FROM pow_rewards");
+                 db.exec("DELETE FROM block_votes");
+                 db.exec("DELETE FROM consensus_rounds");
                  db.exec("DELETE FROM transactions");
                  db.exec("DELETE FROM work_items");
                  db.exec("DELETE FROM blocks WHERE height > 0");
-                 db.exec("UPDATE miners SET blocks_mined = 0");
+                 db.exec(
+                     "UPDATE nodes SET stake = $1, active = true, slashed = false, dishonest = false, "
+                     "blocks_proposed = 0",
+                     {ctx.initial_stake});
                  t.commit();
+                 ctx.network.reset();
                  send(res, {{"reset", true}});
              }));
 }

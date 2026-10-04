@@ -1,12 +1,14 @@
 import { Fragment, useState } from 'react';
 import { api, type Block, type ChainVerification } from '../api';
-import { Badge, Canonical, ErrorBox, Hash, fmtNum, fmtTime, usePoll } from '../components/ui';
+import { Badge, Canonical, ErrorBox, Hash, fmtBig, fmtNum, fmtTime, usePoll } from '../components/ui';
 
 const TAMPERS = [
   { kind: 'tx_decision', label: 'Flip a signed decision' },
   { kind: 'comment', label: "Edit a reviewer's comment" },
   { kind: 'artifact', label: 'Modify an approved artifact' },
-  { kind: 'block_nonce', label: "Change a block's nonce" },
+  { kind: 'validator_signature', label: "Corrupt a validator's vote signature (PoS)" },
+  { kind: 'node_copy', label: "Corrupt a node's local chain copy" },
+  { kind: 'reward_amount', label: 'Falsify a confirmed PoW reward' },
 ] as const;
 
 export default function ChainExplorer() {
@@ -35,7 +37,7 @@ export default function ChainExplorer() {
       setVerification(v);
       setMsg(
         v.ok
-          ? { kind: 'ok', text: `✓ All ${v.height + 1} blocks verified: hashes, links, proof-of-work, miner signatures, merkle roots, auditor signatures and off-chain artifacts.` }
+          ? { kind: 'ok', text: `✓ All ${v.height + 1} blocks verified: hashes, links, proposer selection, stake-weighted quorum, validator signatures, merkle roots, auditor signatures and off-chain artifacts.` }
           : { kind: 'err', text: `✗ Chain integrity broken at block #${v.first_bad_height}. Every later block is invalid too.` },
       );
     } finally {
@@ -109,12 +111,17 @@ export default function ChainExplorer() {
                     <span className="height">#{b.height}</span>
                     <Hash value={b.hash} len={20} zeros />
                     <span className="badge neutral">{b.tx_count} tx</span>
-                    {b.height > 0 && <span className="badge info">{b.miner}</span>}
+                    {b.height > 0 && <span className="badge info">{b.mode} · {b.proposer}</span>}
                     {v && (v.ok ? <Badge kind="ok">valid</Badge> : <Badge kind="bad">invalid</Badge>)}
                   </div>
                   <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>
-                    prev <Hash value={b.prev_hash} len={10} /> · merkle <Hash value={b.merkle_root} len={10} /> · nonce{' '}
-                    {fmtNum(b.nonce)} · {b.difficulty_bits} bits · {fmtTime(b.timestamp_ms)}
+                    prev <Hash value={b.prev_hash} len={10} /> · merkle <Hash value={b.merkle_root} len={10} /> ·{' '}
+                    {b.mode === 'pow' ? (
+                      <>nonce {fmtNum(b.nonce)} · {b.difficulty_hex_zeros} ceros hex</>
+                    ) : (
+                      <>quorum {fmtBig(b.quorum_stake)}/{fmtBig(b.total_stake)} stake</>
+                    )}
+                    {' · '}{fmtTime(b.timestamp_ms)}
                   </div>
                   {broken && (
                     <ul style={{ margin: '6px 0 0', paddingLeft: 18, color: 'var(--low)', fontSize: 13 }}>
@@ -127,9 +134,20 @@ export default function ChainExplorer() {
                     <div onClick={(e) => e.stopPropagation()} style={{ cursor: 'default' }}>
                       <h3 style={{ fontSize: 12, color: 'var(--muted)' }}>Header pre-image (double SHA-256 → block hash)</h3>
                       <pre className="pre">{detail.header_preimage}</pre>
-                      {detail.miner_signature && (
+                      {detail.proposer_signature && (
                         <div style={{ fontSize: 12, marginTop: 6 }}>
-                          miner signature: <span className="mono" style={{ overflowWrap: 'anywhere' }}>{detail.miner_signature}</span>
+                          proposer signature: <span className="mono" style={{ overflowWrap: 'anywhere' }}>{detail.proposer_signature}</span>
+                        </div>
+                      )}
+                      {!!detail.votes?.length && (
+                        <div style={{ fontSize: 12, marginTop: 6 }}>
+                          <div style={{ color: 'var(--muted)' }}>votes ({fmtBig(detail.quorum_stake)}/{fmtBig(detail.total_stake)} stake):</div>
+                          {detail.votes.map((vo) => (
+                            <div key={vo.validator} style={{ marginTop: 2 }}>
+                              <span className="mono">{vo.validator}</span> (stake {vo.stake}) →{' '}
+                              <Hash value={vo.signature} len={10} />
+                            </div>
+                          ))}
                         </div>
                       )}
                       {detail.transactions?.map((t) => (

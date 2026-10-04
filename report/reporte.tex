@@ -1,0 +1,196 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.1cm]{geometry}
+\usepackage[spanish]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\setlist{nosep, topsep=2pt, itemsep=1pt}
+\setlength{\parskip}{3pt}
+\setlength{\parindent}{0pt}
+
+\newtheorem{lemma}{Lema}
+\newtheorem{prop}{Proposición}
+\theoremstyle{remark}
+\newtheorem*{proof*}{Demostración}
+
+\title{\vspace{-1.2em}Simulador de blockchain PoW/PoS: \\[2pt]\large fundamentación matemática de las decisiones de diseño}
+\author{Santiago Cosme \\ \small Universidad Anáhuac México --- Facultad de Ingeniería}
+\date{\small \today}
+
+\begin{document}
+\maketitle
+\vspace{-1.8em}
+
+\section{Introducción y alcance}
+Este reporte documenta las decisiones de diseño del simulador de blockchain construido para el examen de MT, que implementa
+\textbf{Proof of Work (PoW)} y \textbf{Proof of Stake (PoS)} como dos modos de consenso intercambiables sobre el mismo
+formato de bloque y de transacción, con $N$ nodos configurables ($10\le N\le 20$), cada uno con su propio par de llaves y su
+propia copia de la cadena. La guía del proyecto sugiere Python~+~Flask; por decisión explícita se implementa la misma
+especificación sobre el stack ya existente del proyecto (C++17, PostgreSQL, React/TypeScript), que es funcionalmente
+equivalente para los fines de esta evaluación: ambos son servidores HTTP con un núcleo de consenso separable de la capa web,
+tal como exige la sección 6 de la guía.
+
+El dominio de la aplicación (un \emph{ledger} de responsabilidad sobre trabajo de agentes de IA) se conserva como la fuente
+de las transacciones que entran a los bloques; no se agregó un sistema de transferencias emisor/receptor/monto con saldo
+transferible, por las razones que se justifican en la Sección~5.
+
+\section{Estructura común a ambas versiones}
+Un bloque se serializa de forma canónica (orden fijo de campos, separados por \texttt{|}) antes de hashearse, para que el
+hash no dependa del orden de inserción en una estructura de datos:
+\[
+H(b) = \mathrm{SHA256}\Big(\mathrm{SHA256}\big(\;\text{\footnotesize\texttt{v1|altura|hash\_anterior|merkle|timestamp|proponente|nonce|dificultad}}\;\big)\Big)
+\]
+El doble \texttt{SHA-256} (en vez del \texttt{SHA-256} simple sugerido por la guía) es la misma construcción que usa Bitcoin
+para el hash de bloque; es un diseño \emph{al menos} tan fuerte frente a ataques de extensión de longitud, y no cambia
+ninguna propiedad observable exigida por la guía (unicidad, determinismo, avalancha). Los campos \texttt{nonce} y
+\texttt{dificultad} son siempre $0$ en bloques PoS, y \texttt{proponente} es el minero ganador en PoW o el validador
+sorteado en PoS: un único formato de encabezado sirve a ambos modos.
+
+Cada transacción (una aprobación de un revisor humano) se firma con ECDSA sobre P-256 y se verifica con la llave pública;
+el \texttt{tx\_id} se calcula como $\mathrm{SHA256}(\text{canónico}\,\|\,\text{firma})$, de modo que no puede falsificarse sin
+romper la firma. Un bloque debe contener \emph{al menos una} transacción (si el \emph{mempool} está vacío, la ronda se
+rechaza antes de iniciar, con mensaje claro).
+
+Cada uno de los $N$ nodos mantiene su propia copia (en memoria) de la cadena. Tras sellarse un bloque, éste se \emph{difunde}
+a cada nodo; cada nodo acepta el bloque \textbf{si y solo si} enlaza con lo que ya tiene (su \texttt{hash\_anterior} coincide
+con el \emph{tip} almacenado), y lo rechaza —quedando desincronizado hasta una resincronización explícita— en caso contrario.
+Esto modela exactamente la regla de validación/difusión de la sección 2.4 de la guía sin requerir una red P2P real.
+
+\section{Proof of Work}
+\textbf{Partición de nonces.} El minero $i\in\{0,\dots,N-1\}$ prueba únicamente los nonces de su clase de residuo módulo
+$N$: $i, i+N, i+2N,\dots$
+
+\begin{lemma}[Disyunción de clases de residuo]
+Si $i_1\neq i_2$ con $0\le i_1,i_2<N$, entonces para todo $k_1,k_2\in\mathbb{N}$, $i_1+k_1N \neq i_2+k_2N$.
+\end{lemma}
+\begin{proof*}
+Si $i_1+k_1N=i_2+k_2N$ entonces $i_1-i_2=(k_2-k_1)N$, es decir $i_1\equiv i_2\pmod N$. Como $0\le i_1,i_2<N$, la única
+solución es $i_1=i_2$, contradiciendo la hipótesis. $\blacksquare$
+\end{proof*}
+Esto garantiza que \textbf{ningún dos mineros prueban jamás el mismo nonce}, y por lo tanto el valor de nonce ganador, si
+existe, nunca puede repetirse entre dos mineros: la regla de desempate \textbf{``gana el nonce más pequeño''} está bien
+definida (no hay empates reales en el valor, solo en el \emph{momento} en que dos mineros encuentran, cada uno, su propio
+nonce válido dentro de la misma ronda de verificación).
+
+\textbf{Costo esperado.} Modelando cada hash como una variable aproximadamente uniforme en $\{0,1\}^{256}$ (heurística
+estándar de funciones hash criptográficas), la probabilidad de que un intento cumpla ``$d$ ceros hexadecimales iniciales''
+es $p=16^{-d}$. El número de intentos hasta el primer éxito sigue una distribución geométrica con
+$\mathbb{E}[\text{intentos}]=1/p=16^{d}$. Con $N$ mineros trabajando en paralelo sobre clases disjuntas, el trabajo total
+esperado sigue siendo $16^d$, pero el tiempo de pared esperado se divide aproximadamente por $N$. Esto justifica la cota de
+seguridad de $2\times 10^6$ intentos por minero implementada: para $d\le 6$, $16^6\approx 1.68\times10^7$, cubierto con
+margen por $N\ge 10$ mineros en paralelo; si ningún minero resuelve dentro de ese límite, la ronda termina con
+\texttt{no\_quorum} y un mensaje claro en vez de bloquear la aplicación indefinidamente (caso de la sección 5: ``dificultad
+que no se resuelve en tiempo razonable'').
+
+\textbf{Madurez de la recompensa (6 confirmaciones).} La recompensa del bloque de altura $h$ se marca \texttt{confirmed}
+solo cuando la altura de la cadena alcanza $h+6$. La justificación es la misma que en Bitcoin: cada confirmación adicional
+reduce exponencialmente la probabilidad de que ese bloque sea reemplazado por una reorganización, bajo el supuesto de que
+ningún atacante controla una fracción sostenida de la potencia de cómputo; 6 es el valor convencionalmente aceptado para
+considerar el riesgo residual despreciable en la práctica.
+
+\section{Proof of Stake}
+\textbf{Sorteo ponderado.} Dado el conjunto de validadores restantes con apuestas $a_1,\dots,a_k$ y $A=\sum_j a_j$, se
+calcula una semilla determinística $s=\mathrm{SHA256}(\texttt{hash\_anterior|altura|intento})$, se interpreta como entero
+$r = s \bmod A$, y se recorre la lista acumulando $\mathrm{acum}=\sum_{j\le i} a_j$ hasta encontrar el primer $i$ con
+$r<\mathrm{acum}_i$.
+
+\begin{prop}
+Bajo el supuesto de que $s \bmod A$ se distribuye aproximadamente uniforme en $\{0,\dots,A-1\}$ (razonable para una salida
+de SHA-256 frente a $A$ mucho menor que $2^{256}$), el validador $i$ es elegido con probabilidad exactamente
+$a_i/A$.
+\end{prop}
+\begin{proof*}
+El validador $i$ es elegido exactamente cuando $r$ cae en el intervalo $[\mathrm{acum}_{i-1},\mathrm{acum}_i)$, de longitud
+$a_i$. Bajo la uniformidad supuesta, $\Pr[\text{elegido}=i]=a_i/A$. $\blacksquare$
+\end{proof*}
+El parámetro \texttt{intento} (incrementado en cada redraw tras un rechazo) garantiza que un sorteo repetido con el mismo
+\texttt{hash\_anterior} y \texttt{altura} no produzca siempre el mismo resultado.
+
+\textbf{Lema del umbral de quórum.} La guía exige aceptar el bloque si $3V\ge 2A$, con $V$ el stake que vota a favor.
+
+\begin{lemma}[Equivalencia entera del umbral $2/3$]
+Para $V,A\in\mathbb{Z}_{\ge0}$, $\;3V\ge 2A \iff V\ge\left\lceil \dfrac{2A}{3}\right\rceil$.
+\end{lemma}
+\begin{proof*}
+($\Leftarrow$) Si $V\ge\lceil 2A/3\rceil\ge 2A/3$, entonces $3V\ge 2A$.
+($\Rightarrow$) Si $3V\ge 2A$ entonces $V\ge 2A/3$; como $V$ es entero, $V\ge\lceil 2A/3\rceil$. $\blacksquare$
+\end{proof*}
+La implementación calcula $\lceil 2A/3\rceil = \lfloor (2A+2)/3\rfloor$ con aritmética entera (verificado exhaustivamente en
+\texttt{ledger\_selftest} para $A\in[1,300]$), evitando errores de redondeo de punto flotante en la condición de aceptación
+—incluyendo el caso límite exacto que pide la sección 5 (``votación exactamente en $2/3$'').
+
+\textbf{Cota de tolerancia bizantina.} El umbral $\ge 2/3$ es el mínimo que garantiza que dos quórums distintos para bloques
+\emph{en conflicto} a la misma altura sean imposibles si la fracción de stake deshonesto es $<1/3$: dos conjuntos de stake
+honesto, cada uno de tamaño $\ge 2A/3$, se solapan en al menos $2A/3+2A/3-A=A/3$ de stake honesto; si el stake deshonesto
+fuera $\ge A/3$ podría, en el peor caso, estar en ambos ``quórums'' simultáneamente y firmar ambas propuestas, rompiendo la
+seguridad. Con $<1/3$ deshonesto esto es imposible, de ahí la cota clásica de los protocolos BFT.
+
+\textbf{Castigo y redraw.} Ambas reglas de castigo de la guía están implementadas y son seleccionables por el usuario en
+cada ronda (parámetro \texttt{punishment\_rule} de \texttt{POST /api/consensus/propose}): regla (A) $c=a_p$ (el proponente
+deshonesto pierde toda su apuesta y queda inhabilitado permanentemente) y regla (B) $c=\lceil\alpha\cdot a_p\rceil$, con
+$0<\alpha\le1$ configurable --- al no existir un ``valor de las transacciones'' monetario en este dominio sobre el cual
+acotar la pérdida, $\alpha$ se aplica directamente como el porcentaje de su propia apuesta que pierde, que es justamente
+la alternativa que describe la guía en prosa (``pierde su apuesta completa o un porcentaje''); bajo la regla (B) el nodo
+conserva el resto de su stake y sigue elegible en rondas futuras. Ambas reglas mantienen el valor esperado de proponer
+deshonestamente $<0$ mientras el proponente tenga stake positivo en riesgo. Tras el castigo (cualquiera de las dos
+reglas), el nodo se remueve del conjunto elegible \emph{de esta ronda} y se repite el sorteo con un \texttt{intento}
+incrementado.
+
+\begin{prop}[Terminación del redraw]
+El proceso de sorteo-rechazo-castigo termina en a lo más $N$ intentos.
+\end{prop}
+\begin{proof*}
+El conjunto de validadores elegibles pierde exactamente un elemento (el proponente deshonesto) en cada rechazo, y nunca
+gana elementos; es un entero no negativo estrictamente decreciente acotado por $N$, así que llega a $0$ (``\texttt{no\_quorum},
+pool agotado'') en a lo más $N$ pasos si nunca se acepta un bloque antes. $\blacksquare$
+\end{proof*}
+Este es precisamente el caso de la sección 5 ``todos los validadores castigados hasta quedar sin saldo'': el sistema
+termina con un mensaje claro en vez de ciclar indefinidamente.
+
+\section{Decisiones de diseño}
+\textbf{Sin saldo transferible ni doble gasto.} El dominio de la aplicación (responsabilidad sobre trabajo de IA) no
+necesita mover valor entre cuentas; \texttt{stake} (PoS) y \texttt{recompensa} (PoW) son contadores internos —ajustables
+por API o por madurez de confirmaciones— pero nunca se transfieren de un nodo a otro, así que no existe la noción de
+``gastar dos veces'' el mismo valor.
+
+\textbf{Copias de cadena en memoria, Postgres como referencia duradera.} La guía permite simular la red en memoria. Postgres
+guarda la cadena canónica (persistente, auditable); cada uno de los $N$ nodos tiene además un espejo en memoria (altura,
+hash) que, al recibir la difusión de un bloque nuevo, vuelve a correr \emph{la validación completa} contra su propia copia
+(\texttt{Ledger::check\_block}: recalcula el hash, re-verifica la regla de consenso --dificultad en PoW, sorteo y quórum en
+PoS-- y cada firma) usando su propio \texttt{hash\_anterior} almacenado como predecesor esperado, y solo adopta el bloque si
+esa revalidación resulta limpia. Un nodo cuya copia fue corrompida (demo de \emph{tamper}) falla específicamente el enlace
+de \texttt{hash\_anterior} y queda desincronizado hasta una resincronización explícita, sin necesidad de una pila de red
+real.
+
+\textbf{Semilla determinística y reproducible.} Tanto el sorteo de PoS como la verificación de la dificultad en PoW
+dependen únicamente de datos ya en la cadena (\texttt{hash\_anterior}, \texttt{altura}, \texttt{intento}) más la tabla de
+apuestas vigente; dado el mismo estado inicial, la simulación es reproducible, lo que facilita depuración y evaluación tal
+como pide la guía.
+
+\section{Casos contemplados y pruebas}
+La tabla siguiente resume cómo se cubre la lista mínima de casos de la sección 5 de la guía.
+
+\begin{center}
+\small
+\begin{tabular}{p{3.6cm}p{11.8cm}}
+\textbf{Ámbito} & \textbf{Cobertura} \\
+Entradas inválidas & \texttt{api.cpp} rechaza $N\notin[10,20]$, dificultad fuera de $[1,6]$, nodo inexistente y JSON mal
+formado con \texttt{HttpError} (400/404), nunca un 500; cubierto en \texttt{scripts/casos.mjs}. \\
+Transacciones & Firma alterada / de otra llave / sobre trabajo LOW: rechazadas por \texttt{Ledger::check\_block} y la ruta
+\texttt{/api/transactions} (\texttt{scripts/e2e.mjs}). Mempool vacío: rechazado antes de iniciar la ronda. \\
+Cadena & \texttt{verify\_chain} recalcula cada hash y liga; un bloque manipulado invalida todo lo posterior
+(\texttt{/api/demo/tamper} + \texttt{casos.mjs}). \\
+PoW & Nonces disjuntos probados en \texttt{ledger\_selftest} (Lema 1); dos ganadores resueltos por nonce mínimo; límite de
+intentos; recompensa a 6 confirmaciones probada minando 10 bloques en \texttt{casos.mjs}. \\
+PoS & Sorteo ponderado y umbral $2/3$ probados en \texttt{ledger\_selftest} (incluyendo el límite exacto); proponente
+deshonesto $\to$ rechazo $\to$ castigo (reglas A y B, configurables) $\to$ redraw probado en \texttt{e2e.mjs}; ningún
+validador con stake y apuesta negativa cubiertos en \texttt{casos.mjs}. \\
+Aplicación & Reinicio de la simulación (\texttt{/api/demo/reset}), ronda ya corriendo (409), copia de nodo corrupta
+rechazada por revalidación independiente y resincronización cubiertos en \texttt{casos.mjs}; bitácora unificada de eventos
+(\texttt{GET /api/events}) visible en la interfaz; recarga a mitad de ronda y pestañas concurrentes se verificaron
+manualmente (el estado vive en el servidor, no en el cliente). \\
+\end{tabular}
+\end{center}
+
+\end{document}
