@@ -5,3 +5,5 @@ frontend/dist/
 *.tsbuildinfo
 backend/srv.log
 backend/srv.err
+CLAUDE.md
+.env.example
