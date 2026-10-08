@@ -65,11 +65,11 @@ int main() {
     try {
         ledger.apply_schema(env::get("SCHEMA_PATH", "../db/schema.sql"));
         ledger.ensure_genesis();
+        std::cout << "  chain height: " << ledger.tip().header.height << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "error initialising schema: " << e.what() << std::endl;
         return 1;
     }
-    std::cout << "  chain height: " << ledger.tip().header.height << std::endl;
 
     int64_t initial_stake = env::get_int("INITIAL_STAKE", 100);
     NodeNetwork network;

@@ -28,6 +28,18 @@ BlockRow block_from_result(const Result& r, int row) {
 }
 
 void Ledger::apply_schema(const std::string& path) {
+    // The schema only ever ADDs (CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS), so a
+    // database created by the pre-PoS version keeps its old `blocks` table and every later read
+    // would fail with a cryptic "no such column". Detect that up front and say what to do.
+    if (db_.exec("SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND "
+                 "table_name = 'blocks'").rows() > 0 &&
+        db_.exec("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND "
+                 "table_name = 'blocks' AND column_name = 'proposer_name'").rows() == 0) {
+        throw DbError(
+            "la base de datos tiene el esquema ANTERIOR a PoS/PoW (la tabla `blocks` no tiene `proposer_name`) y no se "
+            "puede migrar: su cadena usa otro formato de hash. Usa otra base (cambia PGDATABASE en .env) o recréala: "
+            "`ALTER DATABASE <nombre> RENAME TO <nombre>_legacy;` (conserva los datos) o `DROP DATABASE <nombre>;`");
+    }
     std::ifstream in(path);
     if (!in) throw DbError("cannot open schema file: " + path);
     std::stringstream ss;
