@@ -52,10 +52,13 @@ el \texttt{tx\_id} se calcula como $\mathrm{SHA256}(\text{canónico}\,\|\,\text{
 romper la firma. Un bloque debe contener \emph{al menos una} transacción (si el \emph{mempool} está vacío, la ronda se
 rechaza antes de iniciar, con mensaje claro).
 
-Cada uno de los $N$ nodos mantiene su propia copia (en memoria) de la cadena. Tras sellarse un bloque, éste se \emph{difunde}
-a cada nodo; cada nodo acepta el bloque \textbf{si y solo si} enlaza con lo que ya tiene (su \texttt{hash\_anterior} coincide
-con el \emph{tip} almacenado), y lo rechaza —quedando desincronizado hasta una resincronización explícita— en caso contrario.
-Esto modela exactamente la regla de validación/difusión de la sección 2.4 de la guía sin requerir una red P2P real.
+Cada uno de los $N$ nodos mantiene su propia copia completa (en memoria) de la cadena: bloques, transacciones, votos y la
+tabla de apuestas de cada ronda. Tras sellarse un bloque, éste se \emph{difunde} a cada nodo, que corre la validación completa
+(hash, regla de consenso, firmas, raíz de Merkle) contra \emph{su propio} último bloque, y lo rechaza si falla o si su propia
+copia ya es inválida. Una \emph{cadena completa} recibida de un par se adopta \textbf{solo si todos sus bloques validan desde
+el génesis y es más larga que la propia} (regla de la cadena válida más larga, sección 2.4); una cadena más corta, igual o
+con un bloque intermedio alterado se rechaza con el motivo y el nodo conserva la suya. Un nodo con copia corrupta acepta una
+cadena válida de al menos su misma longitud, que es la única forma de recuperarse. No se requiere una red P2P real.
 
 \section{Proof of Work}
 \textbf{Partición de nonces.} El minero $i\in\{0,\dots,N-1\}$ prueba únicamente los nonces de su clase de residuo módulo
@@ -128,11 +131,18 @@ seguridad. Con $<1/3$ deshonesto esto es imposible, de ahí la cota clásica de 
 
 \textbf{Castigo y redraw.} Ambas reglas de castigo de la guía están implementadas y son seleccionables por el usuario en
 cada ronda (parámetro \texttt{punishment\_rule} de \texttt{POST /api/consensus/propose}): regla (A) $c=a_p$ (el proponente
-deshonesto pierde toda su apuesta y queda inhabilitado permanentemente) y regla (B) $c=\lceil\alpha\cdot a_p\rceil$, con
-$0<\alpha\le1$ configurable --- al no existir un ``valor de las transacciones'' monetario en este dominio sobre el cual
-acotar la pérdida, $\alpha$ se aplica directamente como el porcentaje de su propia apuesta que pierde, que es justamente
-la alternativa que describe la guía en prosa (``pierde su apuesta completa o un porcentaje''); bajo la regla (B) el nodo
-conserva el resto de su stake y sigue elegible en rondas futuras. Ambas reglas mantienen el valor esperado de proponer
+deshonesto pierde toda su apuesta y queda inhabilitado permanentemente) y regla (B) $c=\min(a_p,\lceil\alpha\cdot v\rceil)$,
+con $0<\alpha\le1$ configurable y $v=\text{núm\_tx}\cdot\texttt{TX\_VALUE}$ el ``valor de las transacciones'' del bloque
+(en este dominio cada aprobación vale una constante configurable, no un monto); bajo la regla (B) el nodo conserva el resto de
+su stake y sigue elegible en rondas futuras. \textbf{Regla elegida y justificación:} (B) es la más proporcionada (el castigo
+crece con lo que el bloque falso habría puesto en juego), y (A) se conserva para la demostración del peor caso.
+
+\textbf{Apuestas y máquina de estados.} Cada ronda recorre \texttt{APUESTAS}$\to$\texttt{SORTEO}$\to$\texttt{CANDIDATO}$
+\to$\texttt{VOTACION}$\to$\texttt{ACEPTADO}/\texttt{RECHAZADO}. Cada validador apuesta $0<a_i\le$ su saldo (la apuesta se
+bloquea durante la ronda y se libera al terminar, acepte o rechace); el sorteo y el peso del voto usan $a_i$, no el saldo. Un
+subconjunto de validadores de tamaño configurable se elige con una semilla reproducible; la misma semilla repite el subconjunto
+y los retrasos de voto. Un voto de quien no es validador de la ronda, o un segundo voto del mismo validador, se rechaza con
+mensaje claro y queda en la bitácora. Ambas reglas mantienen el valor esperado de proponer
 deshonestamente $<0$ mientras el proponente tenga stake positivo en riesgo. Tras el castigo (cualquiera de las dos
 reglas), el nodo se remueve del conjunto elegible \emph{de esta ronda} y se repite el sorteo con un \texttt{intento}
 incrementado.
@@ -150,18 +160,16 @@ termina con un mensaje claro en vez de ciclar indefinidamente.
 
 \section{Decisiones de diseño}
 \textbf{Sin saldo transferible ni doble gasto.} El dominio de la aplicación (responsabilidad sobre trabajo de IA) no
-necesita mover valor entre cuentas; \texttt{stake} (PoS) y \texttt{recompensa} (PoW) son contadores internos —ajustables
-por API o por madurez de confirmaciones— pero nunca se transfieren de un nodo a otro, así que no existe la noción de
-``gastar dos veces'' el mismo valor.
+necesita mover valor entre cuentas; \texttt{stake} (lo apostable) y \texttt{saldo} (recompensas acreditadas: PoW a las 6
+confirmaciones, PoS al aceptar el bloque) son contadores internos que nunca se transfieren entre nodos. Los casos de la guía
+sobre saldo se cubren por analogía: apuesta mayor al saldo, cero o negativa se rechaza, y una misma aprobación no puede firmarse
+dos veces (equivalente al doble gasto: una gana y la otra recibe 409, incluso enviadas a la vez).
 
-\textbf{Copias de cadena en memoria, Postgres como referencia duradera.} La guía permite simular la red en memoria. Postgres
-guarda la cadena canónica (persistente, auditable); cada uno de los $N$ nodos tiene además un espejo en memoria (altura,
-hash) que, al recibir la difusión de un bloque nuevo, vuelve a correr \emph{la validación completa} contra su propia copia
-(\texttt{Ledger::check\_block}: recalcula el hash, re-verifica la regla de consenso --dificultad en PoW, sorteo y quórum en
-PoS-- y cada firma) usando su propio \texttt{hash\_anterior} almacenado como predecesor esperado, y solo adopta el bloque si
-esa revalidación resulta limpia. Un nodo cuya copia fue corrompida (demo de \emph{tamper}) falla específicamente el enlace
-de \texttt{hash\_anterior} y queda desincronizado hasta una resincronización explícita, sin necesidad de una pila de red
-real.
+\textbf{Copias de cadena en memoria, Postgres como referencia duradera.} Postgres guarda la cadena canónica
+(persistente, auditable); cada nodo tiene su copia completa en memoria y valida con \texttt{Ledger::check\_block} --la misma
+función que usan \texttt{commit\_block} y \texttt{verify\_chain}-- tanto cada bloque difundido como cada cadena recibida.
+Las validaciones del conjunto de votos (votante perteneciente a la ronda, un solo voto, apuesta igual a la de la tabla
+congelada, suma igual al total, umbral $\ge 2/3$) son una función pura probada sin base de datos.
 
 \textbf{Semilla determinística y reproducible.} Tanto el sorteo de PoS como la verificación de la dificultad en PoW
 dependen únicamente de datos ya en la cadena (\texttt{hash\_anterior}, \texttt{altura}, \texttt{intento}) más la tabla de
@@ -173,24 +181,28 @@ La tabla siguiente resume cómo se cubre la lista mínima de casos de la secció
 
 \begin{center}
 \small
-\begin{tabular}{p{3.6cm}p{11.8cm}}
-\textbf{Ámbito} & \textbf{Cobertura} \\
-Entradas inválidas & \texttt{api.cpp} rechaza $N\notin[10,20]$, dificultad fuera de $[1,6]$, nodo inexistente y JSON mal
-formado con \texttt{HttpError} (400/404), nunca un 500; cubierto en \texttt{scripts/casos.mjs}. \\
-Transacciones & Firma alterada / de otra llave / sobre trabajo LOW: rechazadas por \texttt{Ledger::check\_block} y la ruta
-\texttt{/api/transactions} (\texttt{scripts/e2e.mjs}). Mempool vacío: rechazado antes de iniciar la ronda. \\
-Cadena & \texttt{verify\_chain} recalcula cada hash y liga; un bloque manipulado invalida todo lo posterior
-(\texttt{/api/demo/tamper} + \texttt{casos.mjs}). \\
-PoW & Nonces disjuntos probados en \texttt{ledger\_selftest} (Lema 1); dos ganadores resueltos por nonce mínimo; límite de
-intentos; recompensa a 6 confirmaciones probada minando 10 bloques en \texttt{casos.mjs}. \\
-PoS & Sorteo ponderado y umbral $2/3$ probados en \texttt{ledger\_selftest} (incluyendo el límite exacto); proponente
-deshonesto $\to$ rechazo $\to$ castigo (reglas A y B, configurables) $\to$ redraw probado en \texttt{e2e.mjs}; ningún
-validador con stake y apuesta negativa cubiertos en \texttt{casos.mjs}. \\
-Aplicación & Reinicio de la simulación (\texttt{/api/demo/reset}), ronda ya corriendo (409), copia de nodo corrupta
-rechazada por revalidación independiente y resincronización cubiertos en \texttt{casos.mjs}; bitácora unificada de eventos
-(\texttt{GET /api/events}) visible en la interfaz; recarga a mitad de ronda y pestañas concurrentes se verificaron
-manualmente (el estado vive en el servidor, no en el cliente). \\
+\begin{tabular}{p{3.0cm}p{12.4cm}}
+\textbf{Ámbito} & \textbf{Cobertura (todas en \texttt{scripts/casos.mjs} salvo que se indique)} \\
+Entradas & $N\notin[10,20]$, dificultad fuera de $[1,6]$, modo/valores de tipo incorrecto, JSON mal formado o no-objeto, ids
+desbordados, nodo inexistente: siempre 400/404 con mensaje, nunca 500. \\
+Transacciones & Firma alterada, firmada por otra llave, payload canónico alterado, timestamp fuera de sesgo, doble envío (incluso
+simultáneo): rechazados; mempool vacío al minar/proponer: 409. Obra LOW no firmable (\texttt{e2e.mjs}). \\
+Cadena & Hash o \texttt{hash\_anterior} de un bloque \emph{intermedio} alterado: se marcan ese bloque y todos los posteriores y la
+cadena completa se rechaza; la restauración la deja válida. Cadena recibida por un nodo: más corta, con un bloque intermedio
+alterado o de un nodo inexistente se rechaza; la válida y más larga se adopta. \\
+PoW & Nonces disjuntos y desempate (\texttt{ledger\_selftest}); cancelación de una ronda de dificultad 6; 10 bloques seguidos;
+recompensa consultada antes de 6 confirmaciones $\to$ 409 con confirmaciones faltantes; saldo acreditado al madurar. \\
+PoS & Apuesta $>$ saldo, cero, negativa o no numérica; stake bloqueado durante la ronda; votación \emph{exactamente} en $2/3$ (se
+acepta) y un voto menos (sin quórum, sin castigos); voto de no-validador (403) y doble voto (409); proponente deshonesto con
+reglas A y B y nuevo sorteo; todos castigados hasta quedar sin saldo; semilla reproducible; fases de la máquina de estados;
+recompensa PoS. \\
+Aplicación & Reinicio de la simulación (409 a mitad de ronda, correcto entre rondas), dos pestañas iniciando ronda a la vez (una
+gana, la otra 409), recarga a mitad de ronda (el estado vive en el servidor), nodo corrupto que rechaza bloques y bitácora
+unificada de eventos. \\
 \end{tabular}
 \end{center}
+
+\textbf{Video.} Enlace al video de la demostración (PoW, PoS, un rechazo en PoS y la maduración de una recompensa en PoW):
+\emph{por definir por el equipo antes de la entrega}.
 
 \end{document}

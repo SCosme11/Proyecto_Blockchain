@@ -127,6 +127,29 @@ int main() {
         check(attempts <= 12, "PoS redraw terminates within the initial pool size");
     }
 
+    // PoS vote-set validation (the casos "voto de un nodo que no es validador o que vota dos
+    // veces", "votación exactamente en 2/3", stake inflado).
+    {
+        std::vector<chain::StakeEntry> snap = {{"a", 10}, {"b", 10}, {"c", 10}};  // total 30, threshold 20
+        auto ok = chain::check_vote_set(snap, {{"a", 10}, {"b", 10}}, 30, 20);
+        check(ok.empty(), "vote set: exactly 2/3 of stake is accepted");
+        auto below = chain::check_vote_set(snap, {{"a", 10}}, 30, 10);
+        check(!below.empty(), "vote set: below 2/3 is rejected");
+        auto just_below = chain::check_vote_set({{"a", 1}, {"b", 1}, {"c", 1}, {"d", 1}}, {{"a", 1}, {"b", 1}}, 4, 2);
+        check(!just_below.empty(), "vote set: 2 of 4 (50%) is rejected");
+        auto stranger = chain::check_vote_set(snap, {{"a", 10}, {"b", 10}, {"zz", 10}}, 30, 30);
+        check(!stranger.empty(), "vote set: vote from a non-validator is rejected");
+        auto twice = chain::check_vote_set(snap, {{"a", 10}, {"a", 10}, {"b", 10}}, 30, 30);
+        check(!twice.empty(), "vote set: a validator voting twice is rejected");
+        auto inflated = chain::check_vote_set(snap, {{"a", 50}, {"b", 10}}, 30, 60);
+        check(!inflated.empty(), "vote set: inflated stake_at_vote is rejected");
+        auto bad_total = chain::check_vote_set(snap, {{"a", 10}, {"b", 10}}, 15, 20);
+        check(!bad_total.empty(), "vote set: total_stake not matching the snapshot is rejected");
+        auto bad_sum = chain::check_vote_set(snap, {{"a", 10}, {"b", 10}}, 30, 30);
+        check(!bad_sum.empty(), "vote set: quorum_stake not matching the votes is rejected");
+        check(chain::kMinDifficultyHexZeros >= 1, "PoW difficulty floor is at least 1 hex zero");
+    }
+
     // Rules engine
     RulesEngine re;
     std::string err;

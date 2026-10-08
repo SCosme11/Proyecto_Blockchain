@@ -77,4 +77,23 @@ std::string select_proposer(const std::vector<StakeEntry>& stakes, const std::st
 // V with 3V >= 2*total_stake.
 int64_t quorum_threshold(int64_t total_stake);
 
+// Lowest PoW difficulty a committed block may claim; without a floor a miner could "solve" a
+// block at difficulty 0, which every hash satisfies.
+constexpr int kMinDifficultyHexZeros = 1;
+
+struct VoteStake {
+    std::string name;
+    int64_t stake = 0;
+};
+
+// Pure structural checks on a PoS block's vote set, against the stake table frozen at round
+// time. Returns one message per violation (empty = fine):
+//  - the recorded total_stake must equal the sum of the snapshot;
+//  - every vote must come from a validator in the snapshot, at most once, carrying exactly the
+//    stake the snapshot assigns it (a validator cannot inflate its own weight);
+//  - quorum_stake must equal the sum of the votes and reach quorum_threshold(total_stake).
+// Signature validity is checked separately by the caller (it needs the keys).
+std::vector<std::string> check_vote_set(const std::vector<StakeEntry>& snapshot, const std::vector<VoteStake>& votes,
+                                        int64_t total_stake, int64_t quorum_stake);
+
 }  // namespace chain

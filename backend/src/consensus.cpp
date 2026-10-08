@@ -15,98 +15,252 @@ int64_t now_ms() {
         .count();
 }
 
-ConsensusCoordinator::ConsensusCoordinator(Ledger& ledger, Db& db, NodeNetwork& network, int max_tx_per_block,
-                                           int64_t initial_stake)
-    : ledger_(ledger), db_(db), network_(network), max_tx_(max_tx_per_block), initial_stake_(initial_stake) {}
+namespace {
+
+constexpr int kMinMiners = 10;  // the guide: between 10 and 20 miners
+
+uint64_t fnv1a(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char ch : s) {
+        h ^= ch;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// Frees every locked bet when a PoS round ends, whichever way it ends.
+struct BetRelease {
+    Ledger& ledger;
+    ~BetRelease() {
+        try {
+            ledger.release_all_locks();
+        } catch (...) {
+        }
+    }
+};
+
+}  // namespace
+
+ConsensusCoordinator::ConsensusCoordinator(Ledger& ledger, Db& db, NodeNetwork& network, Config cfg)
+    : ledger_(ledger), db_(db), network_(network), cfg_(cfg) {}
 
 ConsensusCoordinator::~ConsensusCoordinator() {
     stop();
     if (worker_.joinable()) worker_.join();
 }
 
-bool ConsensusCoordinator::start(const std::string& mode, int node_count, int difficulty_hex_zeros,
-                                  int abstain_count, const std::string& punishment_rule, double alpha,
-                                  std::string& err) {
+bool ConsensusCoordinator::start(const ConsensusParams& p, std::string& err, int& status) {
     std::lock_guard<std::mutex> g(mu_);
+    status = 409;
     if (running_.load()) {
         err = "a consensus round is already running";
         return false;
     }
     if (worker_.joinable()) worker_.join();
-    if (mode != "pow" && mode != "pos") {
+    status = 400;
+    if (p.mode != "pow" && p.mode != "pos") {
         err = "mode must be 'pow' or 'pos'";
         return false;
     }
-    if (mode == "pos" && punishment_rule != "A" && punishment_rule != "B") {
+    if (p.mode == "pos" && p.punishment_rule != "A" && p.punishment_rule != "B") {
         err = "punishment_rule must be 'A' or 'B'";
         return false;
     }
-    if (mode == "pos" && punishment_rule == "B" && (alpha <= 0 || alpha > 1)) {
+    if (p.mode == "pos" && p.punishment_rule == "B" && (p.alpha <= 0 || p.alpha > 1)) {
         err = "alpha must satisfy 0 < alpha <= 1";
         return false;
     }
+    if (p.bet_pct < 1 || p.bet_pct > 100) {
+        err = "bet_pct must be between 1 and 100";
+        return false;
+    }
+    if (p.vote_window_ms < 0 || p.vote_window_ms > 30000) {
+        err = "vote_window_ms must be between 0 and 30000";
+        return false;
+    }
+    if (p.validators < 0) {
+        err = "validators must be >= 0 (0 = every node with stake)";
+        return false;
+    }
 
-    auto node_rows = ledger_.ensure_nodes(node_count, initial_stake_);
+    status = 409;
+    auto node_rows = ledger_.ensure_nodes(p.node_count, cfg_.initial_stake);
     std::vector<NodeRow> eligible;
     for (auto& n : node_rows)
         if (n.active && !n.slashed) eligible.push_back(n);
     if (eligible.empty()) {
-        err = "no active (non-slashed) nodes available";
+        err = "no active (non-slashed) nodes available: reset the simulation or use punishment rule B";
         return false;
     }
-    if (ledger_.mempool(max_tx_).empty()) {
+    if (p.mode == "pow" && static_cast<int>(eligible.size()) < kMinMiners) {
+        err = "solo quedan " + std::to_string(eligible.size()) + " mineros elegibles (< " + std::to_string(kMinMiners) +
+              "): hay nodos inhabilitados por castigo; reinicia la simulación";
+        return false;
+    }
+    if (ledger_.mempool(cfg_.max_tx_per_block).empty()) {
         err = "no hay transacciones pendientes: firma al menos un trabajo antes de minar/proponer";
         return false;
     }
-    BlockRow tip = ledger_.tip();
-    network_.sync_registry(node_rows, tip.header.height, tip.hash);
 
-    mode_ = mode;
-    punishment_rule_ = punishment_rule;
-    alpha_ = alpha;
-    miners_.clear();
-    voters_.clear();
-    if (mode == "pow") {
+    uint64_t seed = p.has_seed ? p.seed
+                    : cfg_.default_seed ? cfg_.default_seed
+                                         : static_cast<uint64_t>(now_ms()) * 2654435761ULL + (round_counter_seed_++);
+
+    std::vector<std::unique_ptr<MinerSlot>> miners;
+    std::vector<std::unique_ptr<VoterSlot>> voters;
+    std::map<int, int64_t> locks;
+    if (p.mode == "pow") {
         for (auto& n : eligible) {
             auto s = std::make_unique<MinerSlot>();
             s->node = n;
-            miners_.push_back(std::move(s));
+            miners.push_back(std::move(s));
         }
     } else {
-        int64_t total = 0;
-        for (auto& n : eligible) total += n.stake;
-        if (total <= 0) {
-            err = "active nodes have zero total stake; stake some first";
+        std::vector<NodeRow> candidates;
+        for (auto& n : eligible)
+            if (n.stake > 0) candidates.push_back(n);
+        if (candidates.empty()) {
+            err = "ningún nodo tiene stake (saldo) para apostar: asigna stake a algún nodo primero";
             return false;
         }
-        for (auto& n : eligible) {
+        // Explicit bets must be 0 < a_i <= the node's stake ("apuesta mayor al saldo, cero o negativa").
+        status = 400;
+        for (const auto& [name, amount] : p.bets) {
+            auto it = std::find_if(node_rows.begin(), node_rows.end(), [&](const NodeRow& n) { return n.name == name; });
+            if (it == node_rows.end()) {
+                err = "apuesta de '" + name + "': ese nodo no existe";
+                return false;
+            }
+            if (amount <= 0) {
+                err = "apuesta de '" + name + "' inválida: debe ser mayor que 0";
+                return false;
+            }
+            if (amount > it->stake) {
+                err = "apuesta de '" + name + "' inválida: " + std::to_string(amount) + " excede su saldo (" +
+                      std::to_string(it->stake) + ")";
+                return false;
+            }
+        }
+        status = 409;
+        if (p.validators > 0) {
+            if (p.validators > static_cast<int>(candidates.size())) {
+                err = "se pidieron " + std::to_string(p.validators) + " validadores pero solo " +
+                      std::to_string(candidates.size()) + " nodos tienen stake";
+                return false;
+            }
+            std::mt19937_64 rng(seed);
+            std::shuffle(candidates.begin(), candidates.end(), rng);
+            candidates.resize(p.validators);
+            std::sort(candidates.begin(), candidates.end(), [](const NodeRow& a, const NodeRow& b) { return a.name < b.name; });
+        }
+        for (auto& n : candidates) {
             auto s = std::make_unique<VoterSlot>();
             s->node = n;
-            voters_.push_back(std::move(s));
+            auto it = p.bets.find(n.name);
+            if (it != p.bets.end()) s->bet = it->second;
+            else s->bet = std::max<int64_t>(1, (n.stake * p.bet_pct + 99) / 100);
+            locks[n.id] = s->bet;
+            voters.push_back(std::move(s));
         }
     }
 
+    BlockRow tip = ledger_.tip();
+    network_.sync_registry(ledger_, node_rows);
+    if (!locks.empty()) ledger_.lock_bets(locks);
+
+    mode_ = p.mode;
+    punishment_rule_ = p.punishment_rule;
+    alpha_ = p.alpha;
+    vote_window_ms_ = p.vote_window_ms;
+    seed_ = seed;
+    miners_ = std::move(miners);
+    voters_ = std::move(voters);
+    pool_names_.clear();
+    external_votes_.clear();
     found_ = false;
     stop_ = false;
     result_ = nullptr;
     attempts_log_ = json::array();
+    phase_log_ = json::array();
     finished_ms_ = 0;
     proposer_.clear();
     attempt_ = 0;
     quorum_stake_ = 0;
+    total_stake_ = 0;
+    quorum_threshold_ = 0;
+    height_ = tip.header.height + 1;
+    prev_hash_ = tip.hash;
+    tx_ids_.clear();
     started_ms_ = now_ms();
     ++round_no_;
+    phase_ = p.mode == "pos" ? "APUESTAS" : "MINANDO";
+    phase_log_.push_back({{"phase", phase_}, {"at_ms", 0}});
     running_ = true;
-    if (mode == "pow")
-        worker_ = std::thread([this, difficulty_hex_zeros] { run_pow(difficulty_hex_zeros); });
+    if (p.mode == "pow")
+        worker_ = std::thread([this, d = p.difficulty_hex_zeros] { run_pow(d); });
     else
-        worker_ = std::thread([this, abstain_count] { run_pos(abstain_count); });
+        worker_ = std::thread([this, a = p.abstain_count] { run_pos(a); });
     return true;
 }
 
 void ConsensusCoordinator::stop() {
     stop_ = true;
     found_ = true;
+}
+
+void ConsensusCoordinator::set_phase(const std::string& phase) {
+    std::lock_guard<std::mutex> g(mu_);
+    phase_ = phase;
+    phase_log_.push_back({{"phase", phase}, {"at_ms", now_ms() - started_ms_}});
+}
+
+void ConsensusCoordinator::phase_pause() {
+    for (int waited = 0; waited < cfg_.phase_delay_ms && !stop_.load(); waited += 25)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+}
+
+void ConsensusCoordinator::publish_block(const ChainBlock& cb) {
+    auto refusals = network_.broadcast(ledger_, cb, ledger_.node_keys());
+    for (const auto& r : refusals) ledger_.log_event("node_reject", r);
+}
+
+bool ConsensusCoordinator::submit_vote(const std::string& validator, const std::string& vote, std::string& message,
+                                        int& status) {
+    if (vote != "yes" && vote != "no") {
+        status = 400;
+        message = "vote must be 'yes' or 'no'";
+        return false;
+    }
+    std::string log;
+    bool ok = [&]() {
+        std::lock_guard<std::mutex> g(mu_);
+        auto fail = [&](int st, const std::string& m, bool audit) {
+            status = st;
+            message = m;
+            if (audit) log = "Voto rechazado de " + validator + ": " + m;
+            return false;
+        };
+        if (!running_.load() || mode_ != "pos" || phase_ != "VOTACION")
+            return fail(409, "no hay una votación abierta en este momento", false);
+        VoterSlot* slot = nullptr;
+        for (auto& v : voters_)
+            if (v->node.name == validator) slot = v.get();
+        if (!slot || !pool_names_.count(validator))
+            return fail(403, "'" + validator + "' no es validador de esta ronda", true);
+        if (validator == proposer_)
+            return fail(403, "'" + validator + "' es el proponente: su firma ya respalda el bloque", true);
+        int st = slot->state.load();
+        if (!slot->abstain || st == PosVoted || st == PosAgainst || external_votes_.count(validator))
+            return fail(409, "'" + validator + "' ya emitió su voto: el doble voto se rechaza", true);
+        if (st == PosAbstained) return fail(409, "la ventana de votación de '" + validator + "' ya cerró", true);
+        external_votes_[validator] = vote;
+        status = 200;
+        message = "voto '" + vote + "' de " + validator + " recibido";
+        return true;
+    }();
+    // Written after releasing mu_: never touch the database while holding it.
+    if (!log.empty()) ledger_.log_event("vote_rejected", log);
+    return ok;
 }
 
 // ---------------------------------------------------------------- PoW ----------------------
@@ -148,7 +302,7 @@ void ConsensusCoordinator::run_pow(int difficulty_hex_zeros) {
     json result;
     try {
         BlockRow tip = ledger_.tip();
-        std::vector<TxRow> txs = ledger_.mempool(max_tx_);
+        std::vector<TxRow> txs = ledger_.mempool(cfg_.max_tx_per_block);
         if (txs.empty()) throw std::runtime_error("no pending transactions to mine");
         std::vector<std::string> ids;
         for (auto& t : txs) ids.push_back(t.tx_id);
@@ -216,7 +370,7 @@ void ConsensusCoordinator::run_pow(int difficulty_hex_zeros) {
             json round = {{"participants", participants}, {"duration_ms", duration}};
             try {
                 ledger_.commit_block(b, txs, {}, 0, {}, round);
-                network_.broadcast(ledger_, b, txs, ledger_.node_keys(), {}, 0, {});
+                publish_block({b, txs, {}, {}, 0});
                 result = {{"outcome", "sealed"},     {"proposer", winner->node.name},
                           {"height", b.header.height}, {"hash", b.hash},
                           {"nonce", whdr.nonce},        {"tx_count", b.tx_count}};
@@ -228,6 +382,7 @@ void ConsensusCoordinator::run_pow(int difficulty_hex_zeros) {
         result = {{"outcome", "error"}, {"error", e.what()}};
     }
 
+    set_phase(result.value("outcome", "") == "sealed" ? "GANADOR" : "SIN_GANADOR");
     std::lock_guard<std::mutex> g(mu_);
     result_ = result;
     finished_ms_ = now_ms();
@@ -237,18 +392,40 @@ void ConsensusCoordinator::run_pow(int difficulty_hex_zeros) {
 // ---------------------------------------------------------------- PoS ----------------------
 
 void ConsensusCoordinator::cast_vote(VoterSlot* slot, std::string block_hash, std::string proposer_sig,
-                                      std::string proposer_pubkey) {
+                                      std::string proposer_pubkey, int64_t window_deadline_ms) {
     slot->state = PosVoting;
     // An honest validator checks the proposal before voting: if the proposer's signature does
-    // not verify (a dishonest proposal), it votes no by simply not signing.
+    // not verify (a dishonest proposal), it votes NO.
     if (!crypto::verify_p256(proposer_pubkey, block_hash, proposer_sig)) {
-        slot->state = PosAbstained;
+        slot->state = PosAgainst;
         return;
     }
-    thread_local std::mt19937 rng(std::random_device{}());
+    // Seeded per validator: with the same seed the same validators answer in the same order.
+    std::mt19937_64 rng(seed_ ^ fnv1a(slot->node.name));
     std::uniform_int_distribution<int> delay_ms(50, 300);
     std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms(rng)));
-    if (stop_.load() || slot->abstain) {
+
+    bool vote_yes = !slot->abstain;
+    if (slot->abstain) {
+        // Simulated non-responsive validator: it stays silent unless an external vote arrives
+        // before the voting window closes.
+        while (!stop_.load() && now_ms() < window_deadline_ms) {
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                auto it = external_votes_.find(slot->node.name);
+                if (it != external_votes_.end()) {
+                    if (it->second == "no") {
+                        slot->state = PosAgainst;
+                        return;
+                    }
+                    vote_yes = true;
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    if (stop_.load() || !vote_yes) {
         slot->state = PosAbstained;
         return;
     }
@@ -263,10 +440,13 @@ void ConsensusCoordinator::cast_vote(VoterSlot* slot, std::string block_hash, st
 
 void ConsensusCoordinator::run_pos(int abstain_count) {
     std::lock_guard<std::mutex> chain_lock(ledger_.chain_mu);
+    BetRelease release{ledger_};  // bets stay locked for the round, whatever happens
     json result = nullptr;
+    int64_t bets_total = 0;
+    std::string reward_note;
     try {
         BlockRow tip = ledger_.tip();
-        std::vector<TxRow> txs = ledger_.mempool(max_tx_);
+        std::vector<TxRow> txs = ledger_.mempool(cfg_.max_tx_per_block);
         if (txs.empty()) throw std::runtime_error("no pending transactions to propose");
         std::vector<std::string> ids;
         for (auto& t : txs) ids.push_back(t.tx_id);
@@ -285,34 +465,52 @@ void ConsensusCoordinator::run_pos(int abstain_count) {
         // turns out to be dishonest and gets slashed ("se repite el sorteo con los
         // validadores restantes").
         std::vector<VoterSlot*> pool;
-        for (auto& v : voters_) pool.push_back(v.get());
+        for (auto& v : voters_) {
+            pool.push_back(v.get());
+            bets_total += v->bet;
+        }
+        phase_pause();  // APUESTAS: bets are placed and locked (done in start())
 
         int attempt = 0;
         while (!stop_.load()) {
+            set_phase("SORTEO");
             std::vector<chain::StakeEntry> stake_snapshot;
             int64_t total = 0;
             for (auto* v : pool) {
-                stake_snapshot.push_back({v->node.name, v->node.stake});
-                total += v->node.stake;
+                stake_snapshot.push_back({v->node.name, v->bet});  // the lottery weighs the BET
+                total += v->bet;
             }
             if (pool.empty() || total <= 0) {
+                set_phase("RECHAZADO");
                 result = {{"outcome", "no_quorum"}, {"error", "se agotó el conjunto de validadores sin sellar el bloque"}};
                 break;
             }
-            total_stake_ = total;
-            quorum_threshold_ = chain::quorum_threshold(total);
-            attempt_ = attempt;
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                total_stake_ = total;
+                quorum_threshold_ = chain::quorum_threshold(total);
+                attempt_ = attempt;
+                pool_names_.clear();
+                for (auto* v : pool) pool_names_.insert(v->node.name);
+            }
+            phase_pause();
 
             std::string proposer_name = chain::select_proposer(stake_snapshot, tip.hash, height, attempt);
             VoterSlot* proposer_slot = nullptr;
             for (auto* v : pool)
                 if (v->node.name == proposer_name) proposer_slot = v;
-            proposer_ = proposer_name;
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                proposer_ = proposer_name;
+            }
             if (!proposer_slot) {
+                set_phase("RECHAZADO");
                 result = {{"outcome", "error"}, {"error", "sorteo produjo un proponente desconocido"}};
                 break;
             }
 
+            set_phase("CANDIDATO");
+            phase_pause();
             chain::BlockHeader hdr;
             hdr.height = height;
             hdr.prev_hash = tip.hash;
@@ -325,23 +523,32 @@ void ConsensusCoordinator::run_pos(int abstain_count) {
             std::string proposer_sig = crypto::sign_p256(
                 proposer_slot->node.private_key_pem, dishonest ? block_hash + "|corrupted" : block_hash);
 
-            for (auto* v : pool) {
-                v->state = PosIdle;
-                v->signature.clear();
-                v->voted_at_ms = 0;
-                v->abstain = false;
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                for (auto* v : pool) {
+                    v->state = PosIdle;
+                    v->signature.clear();
+                    v->voted_at_ms = 0;
+                    v->abstain = false;
+                }
+                external_votes_.clear();
+                std::vector<VoterSlot*> order(pool);
+                std::stable_sort(order.begin(), order.end(), [](VoterSlot* a, VoterSlot* b) { return a->bet < b->bet; });
+                int ab = std::min<int>(abstain_count, static_cast<int>(order.size()));
+                for (int i = 0, done = 0; i < static_cast<int>(order.size()) && done < ab; ++i) {
+                    if (order[i] == proposer_slot) continue;  // the proposer's own backing is not simulated away
+                    order[i]->abstain = true;
+                    ++done;
+                }
             }
-            std::vector<VoterSlot*> order(pool);
-            std::sort(order.begin(), order.end(), [](VoterSlot* a, VoterSlot* b) { return a->node.stake < b->node.stake; });
-            int ab = std::min<int>(abstain_count, static_cast<int>(order.size()));
-            for (int i = 0; i < ab; ++i) order[i]->abstain = true;
 
+            set_phase("VOTACION");
+            int64_t window_deadline = now_ms() + vote_window_ms_;
             std::vector<std::thread> threads;
             for (auto* v : pool)
                 if (v != proposer_slot)
-                    threads.emplace_back([this, v, block_hash, proposer_sig, pk = proposer_slot->node.public_key_spki] {
-                        cast_vote(v, block_hash, proposer_sig, pk);
-                    });
+                    threads.emplace_back([this, v, block_hash, proposer_sig, pk = proposer_slot->node.public_key_spki,
+                                          window_deadline] { cast_vote(v, block_hash, proposer_sig, pk, window_deadline); });
             for (auto& t : threads) t.join();
 
             // `participants` must iterate `pool` in the exact same order as `stake_snapshot`
@@ -355,66 +562,84 @@ void ConsensusCoordinator::run_pos(int abstain_count) {
             for (auto* v : pool) {
                 if (v == proposer_slot) {
                     participants.push_back({{"validator", v->node.name},
-                                            {"stake", v->node.stake},
+                                            {"stake", v->bet},
                                             {"vote", dishonest ? "dishonest_proposal" : "proposer"}});
                     // An honest proposer implicitly backs its own proposal: it counts toward
                     // quorum the same way any other "yes" vote does, so it must also appear in
                     // `votes` (using its existing block signature) -- otherwise check_block's
                     // recomputed sum of votes would never match `quorum`.
                     if (!dishonest) {
-                        votes.push_back({v->node.id, v->node.name, proposer_sig, v->node.stake, ts});
-                        quorum += v->node.stake;
+                        votes.push_back({v->node.id, v->node.name, proposer_sig, v->bet, ts});
+                        quorum += v->bet;
                     }
                     continue;
                 }
                 int st = v->state.load();
-                participants.push_back(
-                    {{"validator", v->node.name}, {"stake", v->node.stake}, {"vote", st == PosVoted ? "yes" : "absent"}});
+                const char* label = st == PosVoted ? "yes" : st == PosAgainst ? "no" : "absent";
+                participants.push_back({{"validator", v->node.name}, {"stake", v->bet}, {"vote", label}});
                 if (st == PosVoted) {
-                    votes.push_back({v->node.id, v->node.name, v->signature, v->node.stake, v->voted_at_ms});
-                    quorum += v->node.stake;
+                    votes.push_back({v->node.id, v->node.name, v->signature, v->bet, v->voted_at_ms});
+                    quorum += v->bet;
                 }
             }
-            quorum_stake_ = quorum;
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                quorum_stake_ = quorum;
+            }
 
             int64_t duration = now_ms() - started_ms_;
             json round_log = {{"attempt", attempt},         {"proposer", proposer_name}, {"dishonest", dishonest},
-                               {"quorum_stake", quorum},      {"total_stake", total_stake_}};
+                               {"quorum_stake", quorum},      {"total_stake", total}};
 
-            if (quorum >= quorum_threshold_) {
+            if (quorum >= chain::quorum_threshold(total)) {
                 BlockRow b;
                 b.header = hdr;
                 b.hash = block_hash;
                 b.mode = "pos";
                 b.proposer_signature = proposer_sig;
                 b.quorum_stake = quorum;
-                b.total_stake = total_stake_;
+                b.total_stake = total;
                 b.tx_count = static_cast<int>(txs.size());
                 json round = {{"participants", participants}, {"duration_ms", duration}};
                 try {
-                    ledger_.commit_block(b, txs, stake_snapshot, attempt, votes, round);
-                    network_.broadcast(ledger_, b, txs, ledger_.node_keys(), stake_snapshot, attempt, votes);
+                    ledger_.commit_block(b, txs, stake_snapshot, attempt, votes, round, cfg_.pos_reward);
+                    publish_block({b, txs, votes, stake_snapshot, attempt});
                     round_log["outcome"] = "sealed";
-                    attempts_log_.push_back(round_log);
+                    set_phase("ACEPTADO");
+                    reward_note = "Recompensa PoS: +" + std::to_string(cfg_.pos_reward) + " para " + proposer_name;
+                    {
+                        std::lock_guard<std::mutex> g(mu_);
+                        attempts_log_.push_back(round_log);
+                    }
                     result = {{"outcome", "sealed"},        {"proposer", proposer_name},
                               {"height", b.header.height},   {"hash", b.hash},
-                              {"quorum_stake", quorum},       {"total_stake", total_stake_},
-                              {"tx_count", b.tx_count},       {"attempts", attempt + 1}};
+                              {"quorum_stake", quorum},       {"total_stake", total},
+                              {"tx_count", b.tx_count},       {"attempts", attempt + 1},
+                              {"reward", cfg_.pos_reward}};
                 } catch (const std::exception& e) {
                     round_log["outcome"] = "rejected";
-                    attempts_log_.push_back(round_log);
+                    set_phase("RECHAZADO");
+                    {
+                        std::lock_guard<std::mutex> g(mu_);
+                        attempts_log_.push_back(round_log);
+                    }
                     result = {{"outcome", "rejected"}, {"proposer", proposer_name}, {"error", e.what()}};
                 }
                 break;
             }
 
+            set_phase("RECHAZADO");
             if (!dishonest) {
                 // A genuinely valid proposal simply didn't gather enough participation this
                 // round (e.g. simulated abstentions) -- nothing to punish, the round just ends.
                 round_log["outcome"] = "no_quorum";
-                attempts_log_.push_back(round_log);
+                {
+                    std::lock_guard<std::mutex> g(mu_);
+                    attempts_log_.push_back(round_log);
+                }
                 result = {{"outcome", "no_quorum"},
-                          {"error", "quórum no alcanzado: " + std::to_string(quorum) + "/" + std::to_string(quorum_threshold_)}};
+                          {"error", "quórum no alcanzado: " + std::to_string(quorum) + "/" +
+                                        std::to_string(chain::quorum_threshold(total)) + " (de " + std::to_string(total) + ")"}};
                 break;
             }
 
@@ -423,29 +648,43 @@ void ConsensusCoordinator::run_pos(int abstain_count) {
             db_.exec(
                 "INSERT INTO consensus_rounds (mode, attempt, proposer, participants, quorum_stake, total_stake, "
                 "duration_ms, outcome) VALUES ('pos',$1,$2,$3,$4,$5,$6,'rejected_retry')",
-                {attempt, proposer_name, participants.dump(), quorum, total_stake_, duration});
+                {attempt, proposer_name, participants.dump(), quorum, total, duration});
             round_log["outcome"] = "rejected_retry";
-            attempts_log_.push_back(round_log);
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                attempts_log_.push_back(round_log);
+            }
 
-            // Punishment rule (A): forfeit the whole stake and bar the node from future rounds.
-            // Punishment rule (B): forfeit only a fraction alpha of its own stake ("pierde ...
-            // un porcentaje", per the guide) and stay eligible for later rounds -- there is no
-            // monetary transaction value in this domain to base the cap on, so alpha applies
-            // directly to the proposer's own stake instead of a transaction-value proxy.
+            // c is taken from the proposer's BET a_p. Rule (A): c = a_p, and the node is barred
+            // from future rounds. Rule (B): c = min(a_p, ceil(alpha * value of the block's
+            // transactions)) with value = tx_count * TX_VALUE; the node stays eligible.
             bool bar = punishment_rule_ == "A";
-            int64_t full_stake = proposer_slot->node.stake;
-            int64_t cut = bar ? full_stake : static_cast<int64_t>(std::ceil(alpha_ * static_cast<double>(full_stake)));
-            json evidence = {{"block_hash", block_hash}, {"attempt", attempt}, {"punishment_rule", punishment_rule_}};
+            int64_t bet = proposer_slot->bet;
+            int64_t tx_value_total = static_cast<int64_t>(txs.size()) * cfg_.tx_value;
+            int64_t cut = bar ? bet
+                              : std::min<int64_t>(bet, static_cast<int64_t>(std::ceil(alpha_ * static_cast<double>(tx_value_total))));
+            json evidence = {{"block_hash", block_hash}, {"attempt", attempt}, {"punishment_rule", punishment_rule_},
+                              {"bet", bet},               {"tx_value", tx_value_total}};
             ledger_.slash(proposer_slot->node.id, cut, bar, "dishonest_proposal", evidence,
                          std::optional<int64_t>(height));
             pool.erase(std::remove(pool.begin(), pool.end(), proposer_slot), pool.end());
             ++attempt;
         }
-        if (result.is_null()) result = {{"outcome", "no_quorum"}, {"error", "round stopped"}};
+        if (result.is_null()) {
+            set_phase("RECHAZADO");
+            result = {{"outcome", "no_quorum"}, {"error", "round stopped"}};
+        }
     } catch (const std::exception& e) {
         result = {{"outcome", "error"}, {"error", e.what()}};
     }
 
+    // Bets are released here (BetRelease runs when this function returns); say so in the log.
+    try {
+        if (!reward_note.empty()) ledger_.log_event("reward", reward_note);
+        ledger_.log_event("stake", "Ronda PoS #" + std::to_string(round_no_) + ": apuestas liberadas (total " +
+                                       std::to_string(bets_total) + ")");
+    } catch (...) {
+    }
     std::lock_guard<std::mutex> g(mu_);
     result_ = result;
     finished_ms_ = now_ms();
@@ -460,6 +699,9 @@ json ConsensusCoordinator::snapshot() {
     json j = {{"round", round_no_},
               {"running", running_.load()},
               {"mode", mode_},
+              {"phase", phase_},
+              {"phase_log", phase_log_},
+              {"seed", std::to_string(seed_)},
               {"height", height_},
               {"prev_hash", prev_hash_},
               {"tx_ids", tx_ids_},
@@ -490,13 +732,17 @@ json ConsensusCoordinator::snapshot() {
         j["quorum_threshold"] = quorum_threshold_;
         j["quorum_stake"] = quorum_stake_;
         j["attempts_log"] = attempts_log_;
+        j["vote_window_ms"] = vote_window_ms_;
         json vs = json::array();
         for (auto& v : voters_) {
             int st = v->state.load();
-            const char* status =
-                st == PosVoting ? "voting" : st == PosVoted ? "voted" : st == PosAbstained ? "abstained" : "idle";
+            const char* status = st == PosVoting ? "voting" : st == PosVoted ? "voted" : st == PosAbstained ? "abstained"
+                                 : st == PosAgainst ? "against" : "idle";
             vs.push_back({{"name", v->node.name},
                          {"stake", v->node.stake},
+                         {"bet", v->bet},
+                         {"in_pool", pool_names_.count(v->node.name) > 0},
+                         {"simulated_absent", v->abstain},
                          {"dishonest", v->node.dishonest},
                          {"status", status},
                          {"signature", v->signature.empty() ? json(nullptr) : json(v->signature)}});

@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
 #include <thread>
+#include <type_traits>
 
 #include "crypto.h"
 
@@ -31,20 +33,61 @@ void send(httplib::Response& res, const json& j, int status = 200) {
 }
 
 json body(const httplib::Request& req) {
+    json j;
     try {
-        return json::parse(req.body);
+        j = json::parse(req.body);
     } catch (...) {
         throw HttpError(400, "request body must be valid JSON");
     }
+    // `[]`, `5` or `"x"` parse fine but would make every later `.value()` throw.
+    if (!j.is_object()) throw HttpError(400, "request body must be a JSON object");
+    return j;
+}
+
+// Strict type check: nlohmann's get<int>() silently accepts floats/bools, which would let
+// `{"nodes": 10.7}` or `{"nodes": true}` through as valid integers.
+template <typename T>
+void require_type(const json& v, const char* key) {
+    bool ok = true;
+    if constexpr (std::is_same_v<T, bool>) ok = v.is_boolean();
+    else if constexpr (std::is_integral_v<T>) ok = v.is_number_integer();
+    else if constexpr (std::is_floating_point_v<T>) ok = v.is_number();
+    else if constexpr (std::is_same_v<T, std::string>) ok = v.is_string();
+    if (!ok) throw HttpError(400, std::string("invalid type for field: ") + key);
 }
 
 template <typename T>
 T field(const json& j, const char* key) {
     if (!j.contains(key) || j[key].is_null()) throw HttpError(400, std::string("missing field: ") + key);
+    require_type<T>(j[key], key);
     try {
         return j[key].get<T>();
     } catch (...) {
         throw HttpError(400, std::string("invalid type for field: ") + key);
+    }
+}
+
+// Optional field: absent or null -> `def`; present with the wrong type -> 400 (never a 500).
+template <typename T>
+T opt(const json& j, const char* key, T def) {
+    if (!j.contains(key) || j[key].is_null()) return def;
+    return field<T>(j, key);
+}
+
+// Path ids come from `(\d+)`, so they can still overflow int; report that as a plain 404.
+int64_t path_i64(const std::string& digits) {
+    try {
+        return std::stoll(digits);
+    } catch (...) {
+        throw HttpError(404, "id out of range");
+    }
+}
+
+int path_id(const std::string& digits) {
+    try {
+        return std::stoi(digits);
+    } catch (...) {
+        throw HttpError(404, "id out of range");
     }
 }
 
@@ -60,6 +103,13 @@ httplib::Server::Handler wrap(F fn) {
             send(res, j, e.status);
         } catch (const DbError& e) {
             send(res, {{"error", std::string("database: ") + e.what()}}, 500);
+        } catch (const json::exception& e) {
+            // A malformed/mistyped client payload that slipped past a handler's own checks.
+            send(res, {{"error", std::string("malformed request: ") + e.what()}}, 400);
+        } catch (const std::out_of_range&) {
+            send(res, {{"error", "numeric value out of range"}}, 400);
+        } catch (const std::invalid_argument&) {
+            send(res, {{"error", "invalid numeric value"}}, 400);
         } catch (const std::exception& e) {
             send(res, {{"error", e.what()}}, 500);
         }
@@ -183,6 +233,10 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                            {"max_difficulty_hex_zeros", kMaxDifficulty},
                            {"quorum_numerator", 2},
                            {"quorum_denominator", 3},
+                           {"block_reward", ctx.block_reward},
+                           {"pos_reward", ctx.pos_reward},
+                           {"tx_value", ctx.tx_value},
+                           {"reward_confirmations", 6},
                            {"timestamp_skew_ms", ctx.timestamp_skew_ms}});
             }));
 
@@ -214,7 +268,8 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  json b = body(req);
                  std::string agent = field<std::string>(b, "agent_name");
                  std::string type = field<std::string>(b, "artifact_type");
-                 std::string filename = b.value("filename", "output.txt");
+                 std::string filename = opt<std::string>(b, "filename", "output.txt");
+                 if (filename.empty() || filename.size() > 255) throw HttpError(400, "filename must be 1-255 chars");
                  if (agent.empty() || agent.size() > 100) throw HttpError(400, "agent_name must be 1-100 chars");
                  if (!ctx.rules.valid_artifact_type(type)) throw HttpError(400, "unknown artifact_type: " + type);
 
@@ -230,13 +285,19 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  }
                  if (content.empty()) throw HttpError(400, "artifact content is empty");
 
-                 json mj = b.value("metrics", json::object());
+                 json mj = b.contains("metrics") && !b["metrics"].is_null() ? b["metrics"] : json::object();
+                 if (!mj.is_object()) throw HttpError(400, "metrics must be an object");
                  Metrics m;
                  m.artifact_type = type;
-                 m.self_confidence = mj.value("self_confidence", 0.0);
-                 m.tests_passed_ratio = mj.value("tests_passed_ratio", 0.0);
-                 m.lines_changed = mj.value("lines_changed", 0);
-                 m.has_external_side_effects = mj.value("has_external_side_effects", false);
+                 m.self_confidence = opt<double>(mj, "self_confidence", 0.0);
+                 m.tests_passed_ratio = opt<double>(mj, "tests_passed_ratio", 0.0);
+                 m.lines_changed = opt<int>(mj, "lines_changed", 0);
+                 m.has_external_side_effects = opt<bool>(mj, "has_external_side_effects", false);
+                 if (m.self_confidence < 0 || m.self_confidence > 1)
+                     throw HttpError(400, "metrics.self_confidence must be in [0,1]");
+                 if (m.tests_passed_ratio < 0 || m.tests_passed_ratio > 1)
+                     throw HttpError(400, "metrics.tests_passed_ratio must be in [0,1]");
+                 if (m.lines_changed < 0) throw HttpError(400, "metrics.lines_changed must be >= 0");
                  json stored_metrics = {{"self_confidence", m.self_confidence},
                                         {"tests_passed_ratio", m.tests_passed_ratio},
                                         {"lines_changed", m.lines_changed},
@@ -276,7 +337,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
 
     svr.Get(R"(/api/work/(\d+)/content)", wrap([&](const httplib::Request& req, httplib::Response& res) {
                 Result r = db.exec("SELECT filename, work_hash, content FROM work_items WHERE id = $1",
-                                   {std::string(req.matches[1])});
+                                   {path_i64(req.matches[1])});
                 if (r.rows() == 0) throw HttpError(404, "work item not found");
                 send(res, {{"filename", r.str(0, "filename")},
                            {"work_hash", r.str(0, "work_hash")},
@@ -328,7 +389,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  int64_t work_id = field<int64_t>(b, "work_item_id");
                  int64_t auditor_id = field<int64_t>(b, "auditor_id");
                  std::string decision = field<std::string>(b, "decision");
-                 std::string comment = b.value("comment", "");
+                 std::string comment = opt<std::string>(b, "comment", "");
                  int64_t ts = field<int64_t>(b, "timestamp_ms");
                  std::string sig = field<std::string>(b, "signature");
 
@@ -398,14 +459,16 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
 
     // ---------------- nodes & consensus ----------------
     auto nodes_json = [&]() {
-        Result r = db.exec("SELECT id, name, public_key_spki, stake, active, slashed, dishonest, blocks_proposed "
-                           "FROM nodes ORDER BY name");
+        Result r = db.exec("SELECT id, name, public_key_spki, stake, active, slashed, dishonest, blocks_proposed, "
+                           "balance, locked FROM nodes ORDER BY name");
         json arr = json::array();
         for (int i = 0; i < r.rows(); ++i)
             arr.push_back({{"id", r.i64(i, "id")},
                            {"name", r.str(i, "name")},
                            {"fingerprint", crypto::fingerprint(r.str(i, "public_key_spki"))},
                            {"stake", r.i64(i, "stake")},
+                           {"locked", r.i64(i, "locked")},
+                           {"balance", r.i64(i, "balance")},
                            {"active", r.str(i, "active") == "t"},
                            {"slashed", r.str(i, "slashed") == "t"},
                            {"dishonest", r.str(i, "dishonest") == "t"},
@@ -419,8 +482,8 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
     // "El número de nodos N se elige en la interfaz y debe cumplir 10 <= N <= 20".
     svr.Post("/api/nodes", wrap([&, nodes_json](const httplib::Request& req, httplib::Response& res) {
                  json b = body(req);
-                 int n = b.value("count", kMinNodes);
-                 int64_t stake = b.value("stake", ctx.initial_stake);
+                 int n = opt<int>(b, "count", kMinNodes);
+                 int64_t stake = opt<int64_t>(b, "stake", ctx.initial_stake);
                  if (n < kMinNodes || n > kMaxNodes)
                      throw HttpError(400, "count must be between " + std::to_string(kMinNodes) + " and " +
                                               std::to_string(kMaxNodes));
@@ -430,7 +493,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
              }));
 
     svr.Post(R"(/api/nodes/(\d+)/stake)", wrap([&, nodes_json](const httplib::Request& req, httplib::Response& res) {
-                 int id = std::stoi(std::string(req.matches[1]));
+                 int id = path_id(req.matches[1]);
                  int64_t delta = field<int64_t>(body(req), "delta");
                  std::string err;
                  if (!ctx.ledger.adjust_stake(id, delta, err)) {
@@ -440,8 +503,8 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
              }));
 
     svr.Post(R"(/api/nodes/(\d+)/dishonest)", wrap([&, nodes_json](const httplib::Request& req, httplib::Response& res) {
-                 int id = std::stoi(std::string(req.matches[1]));
-                 bool dishonest = body(req).value("dishonest", true);
+                 int id = path_id(req.matches[1]);
+                 bool dishonest = opt<bool>(body(req), "dishonest", true);
                  std::string err;
                  if (!ctx.ledger.set_dishonest(id, dishonest, err)) throw HttpError(404, err);
                  send(res, nodes_json());
@@ -452,20 +515,79 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                 send(res, ctx.network.status(tip.header.height, tip.hash));
             }));
 
-    svr.Post(R"(/api/nodes/(\d+)/resync)", wrap([&](const httplib::Request& req, httplib::Response& res) {
-                 int id = std::stoi(std::string(req.matches[1]));
+    // A peer (here: the reference chain, or a deliberately bad one) sends a whole chain to one
+    // node; the node validates every block and applies the longest-valid-chain rule.
+    // kind: valid (full reference chain) | shorter (reference minus its last block) |
+    //       tampered (full length, one intermediate block altered)
+    auto deliver_chain = [&ctx](int id, const std::string& kind) {
+        std::vector<ChainBlock> candidate = ctx.ledger.export_chain();
+        if (kind == "shorter") {
+            if (candidate.size() < 2) throw HttpError(409, "seal at least one block first");
+            candidate.pop_back();
+        } else if (kind == "tampered") {
+            if (candidate.size() < 3) throw HttpError(409, "seal at least two blocks first (need an intermediate block)");
+            std::string& h = candidate[candidate.size() / 2].block.hash;
+            h[0] = (h[0] == 'f') ? '0' : 'f';
+        } else if (kind != "valid") {
+            throw HttpError(400, "kind must be valid | shorter | tampered");
+        }
+        auto out = ctx.network.receive_chain(ctx.ledger, id, candidate, ctx.ledger.node_keys());
+        ctx.ledger.log_event(out.accepted ? "chain_accepted" : "chain_rejected",
+                             "Nodo #" + std::to_string(id) + (out.accepted ? " adoptó" : " rechazó") + " una cadena recibida (" +
+                                 kind + "): " + out.reason);
+        return out;
+    };
+
+    svr.Post(R"(/api/nodes/(\d+)/resync)", wrap([&ctx, deliver_chain](const httplib::Request& req, httplib::Response& res) {
+                 int id = path_id(req.matches[1]);
+                 auto out = deliver_chain(id, "valid");
+                 if (!out.accepted && out.reason == "node has no chain copy yet") throw HttpError(404, out.reason);
                  BlockRow tip = ctx.ledger.tip();
-                 std::string err;
-                 if (!ctx.network.resync(id, tip.header.height, tip.hash, err)) throw HttpError(404, err);
-                 send(res, ctx.network.status(tip.header.height, tip.hash));
+                 send(res, {{"accepted", out.accepted},
+                            {"reason", out.reason},
+                            {"nodes", ctx.network.status(tip.header.height, tip.hash)}});
+             }));
+
+    svr.Post(R"(/api/nodes/(\d+)/receive-chain)",
+             wrap([&ctx, deliver_chain](const httplib::Request& req, httplib::Response& res) {
+                 int id = path_id(req.matches[1]);
+                 std::string kind = opt<std::string>(body(req), "kind", "valid");
+                 auto out = deliver_chain(id, kind);
+                 if (!out.accepted && out.reason == "node has no chain copy yet") throw HttpError(404, out.reason);
+                 BlockRow tip = ctx.ledger.tip();
+                 send(res, {{"accepted", out.accepted},
+                            {"reason", out.reason},
+                            {"nodes", ctx.network.status(tip.header.height, tip.hash)}});
              }));
 
     svr.Get("/api/rewards", wrap([&](const httplib::Request&, httplib::Response& res) {
+                int64_t tip_h = ctx.ledger.tip_height();
                 json arr = json::array();
                 for (const auto& w : ctx.ledger.rewards())
-                    arr.push_back({{"height", w.height}, {"miner", w.miner_name}, {"confirmed", w.confirmed}});
+                    arr.push_back({{"height", w.height},
+                                   {"miner", w.miner_name},
+                                   {"confirmed", w.confirmed},
+                                   {"amount", w.amount},
+                                   {"confirmations", std::max<int64_t>(0, tip_h - w.height)},
+                                   {"remaining_confirmations", std::max<int64_t>(0, w.height + 6 - tip_h)}});
                 send(res, arr);
             }));
+
+    // Asking for a reward before it has matured is refused with the exact number of missing
+    // confirmations (and written to the log); once matured it is already credited.
+    svr.Post(R"(/api/rewards/(\d+)/claim)", wrap([&](const httplib::Request& req, httplib::Response& res) {
+                 int64_t height = path_i64(req.matches[1]);
+                 auto w = ctx.ledger.reward(height);
+                 if (!w) throw HttpError(404, "el bloque #" + std::to_string(height) + " no tiene recompensa PoW");
+                 int64_t tip_h = ctx.ledger.tip_height();
+                 if (!w->confirmed) {
+                     int64_t missing = std::max<int64_t>(1, w->height + 6 - tip_h);
+                     std::string msg = "recompensa pendiente: faltan " + std::to_string(missing) + " confirmaciones";
+                     ctx.ledger.log_event("reward_claim_rejected", "Reclamo rechazado del bloque #" + std::to_string(height) + ": " + msg);
+                     throw HttpError(409, msg);
+                 }
+                 send(res, {{"height", w->height}, {"miner", w->miner_name}, {"amount", w->amount}, {"credited", true}});
+             }));
 
     // Unified "bitácora": bloque minado/sellado, ronda rechazada, castigo (slashing) y
     // recompensa acreditada, mezclados y ordenados del más reciente al más antiguo -- lo que
@@ -476,6 +598,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                     if (!req.get_param_value("limit").empty()) limit = std::stoi(req.get_param_value("limit"));
                 } catch (...) {
                 }
+                limit = std::max(1, std::min(limit, 500));
                 auto ts_expr = [](const char* col) {
                     return std::string("to_char(") + col + " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')";
                 };
@@ -522,6 +645,13 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                     events.push_back({{"type", "reward_confirmed"}, {"message", msg}, {"created_at", rewards.str(i, "ts")}});
                 }
 
+                Result logs = db.exec(std::string("SELECT type, message, ") + ts_expr("created_at") +
+                                      " AS ts FROM event_log ORDER BY id DESC LIMIT 200");
+                for (int i = 0; i < logs.rows(); ++i)
+                    events.push_back({{"type", logs.str(i, "type")},
+                                      {"message", logs.str(i, "message")},
+                                      {"created_at", logs.str(i, "ts")}});
+
                 std::sort(events.begin(), events.end(), [](const json& a, const json& b) {
                     return a["created_at"].get<std::string>() > b["created_at"].get<std::string>();
                 });
@@ -531,28 +661,62 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
 
     svr.Post("/api/consensus/propose", wrap([&](const httplib::Request& req, httplib::Response& res) {
                  json b = body(req);
-                 std::string mode = b.value("mode", "pos");
-                 if (mode != "pow" && mode != "pos") throw HttpError(400, "mode must be 'pow' or 'pos'");
-                 int n = b.value("nodes", kMinNodes);
-                 if (n < kMinNodes || n > kMaxNodes)
+                 ConsensusParams p;
+                 p.mode = opt<std::string>(b, "mode", "pos");
+                 if (p.mode != "pow" && p.mode != "pos") throw HttpError(400, "mode must be 'pow' or 'pos'");
+                 p.node_count = opt<int>(b, "nodes", kMinNodes);
+                 if (p.node_count < kMinNodes || p.node_count > kMaxNodes)
                      throw HttpError(400, "nodes must be between " + std::to_string(kMinNodes) + " and " +
                                               std::to_string(kMaxNodes));
-                 int difficulty = b.value("difficulty_hex_zeros", 4);
-                 if (mode == "pow" && (difficulty < kMinDifficulty || difficulty > kMaxDifficulty))
+                 p.difficulty_hex_zeros = opt<int>(b, "difficulty_hex_zeros", 4);
+                 if (p.mode == "pow" &&
+                     (p.difficulty_hex_zeros < kMinDifficulty || p.difficulty_hex_zeros > kMaxDifficulty))
                      throw HttpError(400, "difficulty_hex_zeros must be between " + std::to_string(kMinDifficulty) +
                                               " and " + std::to_string(kMaxDifficulty));
-                 int abstain = b.value("abstain", 0);
-                 if (abstain < 0 || abstain > n) throw HttpError(400, "abstain must be 0-" + std::to_string(n));
-                 std::string punishment_rule = b.value("punishment_rule", "A");
-                 if (mode == "pos" && punishment_rule != "A" && punishment_rule != "B")
+                 p.abstain_count = opt<int>(b, "abstain", 0);
+                 if (p.abstain_count < 0 || p.abstain_count > p.node_count)
+                     throw HttpError(400, "abstain must be 0-" + std::to_string(p.node_count));
+                 p.punishment_rule = opt<std::string>(b, "punishment_rule", "A");
+                 if (p.mode == "pos" && p.punishment_rule != "A" && p.punishment_rule != "B")
                      throw HttpError(400, "punishment_rule must be 'A' or 'B'");
-                 double alpha = b.value("alpha", 1.0);
-                 if (mode == "pos" && punishment_rule == "B" && (alpha <= 0 || alpha > 1))
+                 p.alpha = opt<double>(b, "alpha", 1.0);
+                 if (p.mode == "pos" && p.punishment_rule == "B" && (p.alpha <= 0 || p.alpha > 1))
                      throw HttpError(400, "alpha must satisfy 0 < alpha <= 1");
+                 p.validators = opt<int>(b, "validators", 0);
+                 if (p.validators < 0 || p.validators > p.node_count)
+                     throw HttpError(400, "validators must be 0-" + std::to_string(p.node_count) + " (0 = all with stake)");
+                 p.bet_pct = opt<int>(b, "bet_pct", 100);
+                 if (p.bet_pct < 1 || p.bet_pct > 100) throw HttpError(400, "bet_pct must be between 1 and 100");
+                 p.vote_window_ms = opt<int>(b, "vote_window_ms", 0);
+                 if (p.vote_window_ms < 0 || p.vote_window_ms > 30000)
+                     throw HttpError(400, "vote_window_ms must be between 0 and 30000");
+                 if (b.contains("seed") && !b["seed"].is_null()) {
+                     p.seed = static_cast<uint64_t>(field<int64_t>(b, "seed"));
+                     p.has_seed = true;
+                 }
+                 if (b.contains("bets") && !b["bets"].is_null()) {
+                     if (!b["bets"].is_object()) throw HttpError(400, "bets must be an object {node-name: amount}");
+                     for (auto it = b["bets"].begin(); it != b["bets"].end(); ++it) {
+                         if (!it.value().is_number_integer()) throw HttpError(400, "bet of '" + it.key() + "' must be an integer");
+                         p.bets[it.key()] = it.value().get<int64_t>();
+                     }
+                 }
                  std::string err;
-                 if (!ctx.consensus.start(mode, n, difficulty, abstain, punishment_rule, alpha, err))
-                     throw HttpError(409, err);
+                 int status = 409;
+                 if (!ctx.consensus.start(p, err, status)) throw HttpError(status, err);
                  send(res, ctx.consensus.snapshot(), 202);
+             }));
+
+    // External vote on behalf of a validator while a PoS round is in VOTACION. Anything that
+    // is not a legitimate, first vote of a validator of this round is refused with a clear reason.
+    svr.Post("/api/consensus/vote", wrap([&](const httplib::Request& req, httplib::Response& res) {
+                 json b = body(req);
+                 std::string validator = field<std::string>(b, "validator");
+                 std::string vote = opt<std::string>(b, "vote", "yes");
+                 std::string message;
+                 int status = 200;
+                 if (!ctx.consensus.submit_vote(validator, vote, message, status)) throw HttpError(status, message);
+                 send(res, {{"accepted", true}, {"message", message}});
              }));
 
     svr.Post("/api/consensus/stop", wrap([&](const httplib::Request&, httplib::Response& res) {
@@ -608,7 +772,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
             }));
 
     svr.Get(R"(/api/blocks/(\d+))", wrap([&](const httplib::Request& req, httplib::Response& res) {
-                std::string h = req.matches[1];
+                std::string h = std::to_string(path_i64(req.matches[1]));
                 Result r = db.exec("SELECT * FROM blocks WHERE height = $1", {h});
                 if (r.rows() == 0) throw HttpError(404, "block not found");
                 json j = block_json(block_from_result(r, 0));
@@ -637,18 +801,26 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
     // ---------------- demo helpers ----------------
     // Simulates an insider editing the database directly, to show the chain detects it.
     svr.Post("/api/demo/tamper", wrap([&](const httplib::Request& req, httplib::Response& res) {
-                 std::string kind = body(req).value("kind", "tx_decision");
+                 json tb = body(req);
+                 std::string kind = opt<std::string>(tb, "kind", "tx_decision");
+                 int b_node = static_cast<int>(opt<int64_t>(tb, "node_id", -1));
                  auto l = db.lock();
                  json out = {{"kind", kind}};
                  if (kind == "node_copy") {
-                     Result n = db.exec("SELECT id FROM nodes ORDER BY name LIMIT 1");
-                     if (n.rows() == 0) throw HttpError(409, "register at least one node first");
-                     int id = static_cast<int>(n.i64(0, "id"));
+                     // Corrupts a block in the MIDDLE of one node's own copy (not the reference chain).
+                     int target = -1;
+                     if (b_node >= 0) target = b_node;
                      std::string err;
-                     if (!ctx.network.tamper(id, err)) throw HttpError(409, err);
-                     db.exec("INSERT INTO tamper_log (kind, target) VALUES ($1,$2)", {kind, std::to_string(id)});
-                     out["target"] = "node #" + std::to_string(id) + "'s local chain copy";
-                     out["change"] = "tip hash corrupted; it will reject the next broadcast";
+                     int node_hit = 0;
+                     int64_t height_hit = 0;
+                     if (!ctx.network.tamper(ctx.ledger, target, ctx.ledger.node_keys(), err, &node_hit, &height_hit))
+                         throw HttpError(409, err);
+                     db.exec("INSERT INTO tamper_log (kind, target) VALUES ($1,$2)", {kind, std::to_string(node_hit)});
+                     out["target"] = "node #" + std::to_string(node_hit) + "'s local chain copy";
+                     out["change"] = "block #" + std::to_string(height_hit) +
+                                     " altered in its own copy; the node must now reject new blocks and invalid chains";
+                     ctx.ledger.log_event("tamper", "Copia local del nodo #" + std::to_string(node_hit) +
+                                                        " manipulada en el bloque #" + std::to_string(height_hit));
                      send(res, out);
                      return;
                  }
@@ -680,6 +852,25 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                              {vote_id});
                      out["target"] = "a validator's vote on block #" + h;
                      out["change"] = "vote signature corrupted";
+                     send(res, out);
+                     return;
+                 }
+
+                 if (kind == "intermediate_block" || kind == "block_hash") {
+                     // Alters the stored header of a block that is NOT the tip: its own hash
+                     // ("block_hash") or the link to its predecessor ("intermediate_block").
+                     Result bl = db.exec("SELECT height FROM blocks WHERE height > 0 ORDER BY height");
+                     if (bl.rows() < 2) throw HttpError(409, "seal at least two blocks first (need an intermediate block)");
+                     std::string h = bl.str((bl.rows() - 1) / 2, "height");
+                     std::string col = kind == "block_hash" ? "hash" : "prev_hash";
+                     Result cur = db.exec("SELECT " + col + " AS v FROM blocks WHERE height = $1", {h});
+                     db.exec("INSERT INTO tamper_log (kind, target, original_text) VALUES ($1,$2,$3)",
+                             {kind, h, cur.str(0, "v")});
+                     db.exec("UPDATE blocks SET " + col + " = (CASE WHEN left(" + col + ",1) = 'f' THEN '0' ELSE 'f' END) "
+                             "|| substr(" + col + ",2) WHERE height = $1", {h});
+                     out["target"] = "block #" + h + " (intermediate)";
+                     out["change"] = kind == "block_hash" ? "its stored hash was altered" : "its hash_anterior was altered";
+                     ctx.ledger.log_event("tamper", "Bloque intermedio #" + h + " manipulado (" + kind + ")");
                      send(res, out);
                      return;
                  }
@@ -722,7 +913,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  } else {
                      throw HttpError(400,
                                      "kind must be tx_decision | comment | artifact | validator_signature | "
-                                     "node_copy | reward_amount");
+                                     "node_copy | reward_amount | intermediate_block | block_hash");
                  }
                  send(res, out);
              }));
@@ -737,10 +928,13 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                                  {r.str(i, "original_text"), target});
                      } else if (kind == "reward_amount") {
                          db.exec("UPDATE pow_rewards SET confirmed = true WHERE height = $1::bigint", {target});
+                     } else if (kind == "intermediate_block" || kind == "block_hash") {
+                         db.exec(std::string("UPDATE blocks SET ") + (kind == "block_hash" ? "hash" : "prev_hash") +
+                                     " = $1 WHERE height = $2::bigint",
+                                 {r.str(i, "original_text"), target});
                      } else if (kind == "node_copy") {
-                         BlockRow tip = ctx.ledger.tip();
-                         std::string err;
-                         ctx.network.resync(std::stoi(target), tip.header.height, tip.hash, err);
+                         ctx.network.receive_chain(ctx.ledger, std::stoi(target), ctx.ledger.export_chain(),
+                                                   ctx.ledger.node_keys());
                      } else if (kind == "tx_decision") {
                          std::string c = r.str(i, "original_text");
                          chain::TxFields f;
@@ -765,6 +959,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  std::lock_guard<std::mutex> chain_lock(ctx.ledger.chain_mu);
                  Db::Transaction t(db);
                  db.exec("DELETE FROM tamper_log");
+                 db.exec("DELETE FROM event_log");
                  db.exec("DELETE FROM slashing_events");
                  db.exec("DELETE FROM pow_rewards");
                  db.exec("DELETE FROM block_votes");
@@ -774,7 +969,7 @@ void register_routes(httplib::Server& svr, AppContext& ctx) {
                  db.exec("DELETE FROM blocks WHERE height > 0");
                  db.exec(
                      "UPDATE nodes SET stake = $1, active = true, slashed = false, dishonest = false, "
-                     "blocks_proposed = 0",
+                     "blocks_proposed = 0, balance = 0, locked = 0",
                      {ctx.initial_stake});
                  t.commit();
                  ctx.network.reset();

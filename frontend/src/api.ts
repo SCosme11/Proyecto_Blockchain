@@ -21,6 +21,10 @@ export interface Config {
   max_difficulty_hex_zeros: number;
   quorum_numerator: number;
   quorum_denominator: number;
+  block_reward: number;
+  pos_reward: number;
+  tx_value: number;
+  reward_confirmations: number;
   timestamp_skew_ms: number;
 }
 
@@ -115,6 +119,8 @@ export interface NodeInfo {
   name: string;
   fingerprint: string;
   stake: number;
+  locked: number;
+  balance: number;
   active: boolean;
   slashed: boolean;
   dishonest: boolean;
@@ -127,17 +133,28 @@ export interface NodeSyncStatus {
   height: number;
   hash: string;
   synced: boolean;
+  valid: boolean;
+  chain_length: number;
   note: string | null;
+}
+
+export interface ChainDelivery {
+  accepted: boolean;
+  reason: string;
+  nodes: NodeSyncStatus[];
 }
 
 export interface Reward {
   height: number;
   miner: string;
   confirmed: boolean;
+  amount: number;
+  confirmations: number;
+  remaining_confirmations: number;
 }
 
 export interface LogEvent {
-  type: 'block' | 'round_rejected' | 'slash' | 'reward_confirmed';
+  type: string;
   message: string;
   created_at: string;
 }
@@ -153,8 +170,11 @@ export interface MinerLive {
 export interface ValidatorLive {
   name: string;
   stake: number;
+  bet: number;
+  in_pool: boolean;
+  simulated_absent: boolean;
   dishonest: boolean;
-  status: 'idle' | 'voting' | 'voted' | 'abstained';
+  status: 'idle' | 'voting' | 'voted' | 'abstained' | 'against';
   signature: string | null;
 }
 
@@ -168,6 +188,7 @@ export interface ConsensusResult {
   total_stake?: number;
   tx_count?: number;
   attempts?: number;
+  reward?: number;
   error?: string;
 }
 
@@ -184,6 +205,9 @@ export interface ConsensusSnapshot {
   round: number;
   running: boolean;
   mode: 'pow' | 'pos' | '';
+  phase: string;
+  phase_log: { phase: string; at_ms: number }[];
+  seed: string;
   height: number;
   prev_hash: string;
   tx_ids: string[];
@@ -198,6 +222,7 @@ export interface ConsensusSnapshot {
   quorum_threshold?: number;
   quorum_stake?: number;
   attempts_log?: AttemptLogEntry[];
+  vote_window_ms?: number;
   validators?: ValidatorLive[];
 }
 
@@ -219,6 +244,20 @@ export interface ChainVerification {
   height: number;
   first_bad_height: number | null;
   blocks: { height: number; hash: string; ok: boolean; errors: string[] }[];
+}
+
+export interface ProposeParams {
+  mode: 'pow' | 'pos';
+  nodes: number;
+  difficulty_hex_zeros?: number;
+  abstain?: number;
+  punishment_rule?: 'A' | 'B';
+  alpha?: number;
+  validators?: number;
+  bet_pct?: number;
+  bets?: Record<string, number>;
+  vote_window_ms?: number;
+  seed?: number;
 }
 
 export class ApiError extends Error {
@@ -281,26 +320,17 @@ export const api = {
   setDishonest: (id: number, dishonest: boolean) =>
     request<NodeInfo[]>('POST', `/api/nodes/${id}/dishonest`, { dishonest }),
   nodesSync: () => request<NodeSyncStatus[]>('GET', '/api/nodes/sync'),
-  resyncNode: (id: number) => request<NodeSyncStatus[]>('POST', `/api/nodes/${id}/resync`),
+  resyncNode: (id: number) => request<ChainDelivery>('POST', `/api/nodes/${id}/resync`),
+  receiveChain: (id: number, kind: 'valid' | 'shorter' | 'tampered') =>
+    request<ChainDelivery>('POST', `/api/nodes/${id}/receive-chain`, { kind }),
   rewards: () => request<Reward[]>('GET', '/api/rewards'),
+  claimReward: (height: number) =>
+    request<{ height: number; miner: string; amount: number; credited: boolean }>('POST', `/api/rewards/${height}/claim`),
   events: () => request<LogEvent[]>('GET', '/api/events'),
 
-  propose: (
-    mode: 'pow' | 'pos',
-    nodes: number,
-    difficulty_hex_zeros: number,
-    abstain: number,
-    punishment_rule: 'A' | 'B' = 'A',
-    alpha = 1,
-  ) =>
-    request<ConsensusSnapshot>('POST', '/api/consensus/propose', {
-      mode,
-      nodes,
-      difficulty_hex_zeros,
-      abstain,
-      punishment_rule,
-      alpha,
-    }),
+  propose: (p: ProposeParams) => request<ConsensusSnapshot>('POST', '/api/consensus/propose', p),
+  vote: (validator: string, vote: 'yes' | 'no') =>
+    request<{ accepted: boolean; message: string }>('POST', '/api/consensus/vote', { validator, vote }),
   stopConsensus: () => request<unknown>('POST', '/api/consensus/stop'),
   consensusStatus: () => request<ConsensusSnapshot>('GET', '/api/consensus/status'),
   rounds: () => request<Round[]>('GET', '/api/rounds'),
@@ -310,7 +340,15 @@ export const api = {
   verify: () => request<ChainVerification>('GET', '/api/chain/verify'),
 
   tamper: (
-    kind: 'tx_decision' | 'comment' | 'artifact' | 'validator_signature' | 'node_copy' | 'reward_amount',
+    kind:
+      | 'tx_decision'
+      | 'comment'
+      | 'artifact'
+      | 'validator_signature'
+      | 'node_copy'
+      | 'reward_amount'
+      | 'intermediate_block'
+      | 'block_hash',
   ) => request<{ kind: string; target: string; change: string }>('POST', '/api/demo/tamper', { kind }),
   restore: () => request<{ restored: number }>('POST', '/api/demo/restore'),
   reset: () => request<unknown>('POST', '/api/demo/reset'),

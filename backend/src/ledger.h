@@ -30,6 +30,8 @@ struct NodeRow {
     bool active = true;
     bool slashed = false;
     bool dishonest = false;
+    int64_t balance = 0;  // credited rewards
+    int64_t locked = 0;   // part of `stake` bet in the round currently running
 };
 
 struct VoteRow {
@@ -55,6 +57,17 @@ struct RewardRow {
     int miner_id = 0;
     std::string miner_name;
     bool confirmed = false;
+    int64_t amount = 0;
+};
+
+// A block together with everything needed to re-validate it in isolation. A node's own copy of
+// the chain is a vector of these (see network.h).
+struct ChainBlock {
+    BlockRow block;
+    std::vector<TxRow> txs;
+    std::vector<VoteRow> votes;
+    std::vector<chain::StakeEntry> snapshot;  // PoS: stake table frozen at round time
+    int attempt = 0;
 };
 
 class Ledger {
@@ -98,10 +111,35 @@ public:
                                          bool check_artifacts);
 
     // Atomically appends a block (validated first) plus its votes/round record and, for PoW
-    // blocks, a pending reward entry. Throws on rejection.
+    // blocks, a pending reward entry. PoS blocks credit `proposer_reward` to the proposer's
+    // balance immediately. Throws on rejection.
     void commit_block(const BlockRow& b, const std::vector<TxRow>& txs,
                        const std::vector<chain::StakeEntry>& stake_snapshot, int attempt,
-                       const std::vector<VoteRow>& votes, const nlohmann::json& round);
+                       const std::vector<VoteRow>& votes, const nlohmann::json& round,
+                       int64_t proposer_reward = 0);
+
+    // Reward paid per PoW block once it matures (6 confirmations).
+    int64_t block_reward = 10;
+
+    // Snapshot of the whole reference chain (blocks + txs + votes + stake snapshots), the
+    // thing a node would send a peer. Takes the DB lock.
+    std::vector<ChainBlock> export_chain();
+
+    // Validates a whole chain from genesis and returns the same JSON shape as verify_chain().
+    // `check_artifacts` additionally re-hashes the off-chain artifacts (needs the DB).
+    nlohmann::json validate_chain(const std::vector<ChainBlock>& chain,
+                                  const std::map<std::string, std::string>& node_keys, bool check_artifacts);
+
+    // Reward status for one block height (nullopt if that block has no PoW reward).
+    std::optional<RewardRow> reward(int64_t height);
+    int64_t tip_height();
+
+    // Bets (PoS): lock/release the part of each node's stake wagered in the running round.
+    void lock_bets(const std::map<int, int64_t>& bets);
+    void release_all_locks();
+
+    // Appends to the human-readable audit log shown in the UI.
+    void log_event(const std::string& type, const std::string& message);
 
     // Reward bookkeeping (PoW): rewards for the miner of `height` mature once the chain
     // reaches height+6. Called automatically after every commit.

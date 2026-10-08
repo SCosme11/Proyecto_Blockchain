@@ -1,5 +1,7 @@
 #include "chain.h"
 
+#include <map>
+#include <set>
 #include <sstream>
 
 #include "crypto.h"
@@ -124,6 +126,39 @@ std::string select_proposer(const std::vector<StakeEntry>& stakes, const std::st
 int64_t quorum_threshold(int64_t total_stake) {
     // ceil(2 * total / 3) without floating point.
     return (2 * total_stake + 2) / 3;
+}
+
+std::vector<std::string> check_vote_set(const std::vector<StakeEntry>& snapshot, const std::vector<VoteStake>& votes,
+                                        int64_t total_stake, int64_t quorum_stake) {
+    std::vector<std::string> errs;
+    std::map<std::string, int64_t> table;
+    int64_t snapshot_total = 0;
+    for (const auto& e : snapshot) {
+        table[e.name] = e.stake;
+        snapshot_total += e.stake;
+    }
+    if (total_stake != snapshot_total)
+        errs.push_back("total_stake " + std::to_string(total_stake) + " does not match the round's stake snapshot (" +
+                       std::to_string(snapshot_total) + ")");
+
+    std::set<std::string> seen;
+    int64_t sum = 0;
+    for (const auto& v : votes) {
+        auto it = table.find(v.name);
+        if (it == table.end()) {
+            errs.push_back("vote from '" + v.name + "', who is not a validator of this round");
+        } else if (v.stake != it->second) {
+            errs.push_back("vote of '" + v.name + "' claims stake " + std::to_string(v.stake) +
+                           " but the round snapshot says " + std::to_string(it->second));
+        }
+        if (!seen.insert(v.name).second) errs.push_back("'" + v.name + "' voted more than once");
+        sum += v.stake;
+    }
+    if (sum != quorum_stake) errs.push_back("quorum_stake does not match the sum of recorded votes");
+    if (quorum_stake < quorum_threshold(total_stake))
+        errs.push_back("quorum not reached: " + std::to_string(quorum_stake) + "/" + std::to_string(total_stake) +
+                       " stake signed");
+    return errs;
 }
 
 }  // namespace chain

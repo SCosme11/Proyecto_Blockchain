@@ -7,7 +7,9 @@ const TAMPERS = [
   { kind: 'comment', label: "Edit a reviewer's comment" },
   { kind: 'artifact', label: 'Modify an approved artifact' },
   { kind: 'validator_signature', label: "Corrupt a validator's vote signature (PoS)" },
-  { kind: 'node_copy', label: "Corrupt a node's local chain copy" },
+  { kind: 'node_copy', label: "Corrupt a block in the middle of a node's own chain copy" },
+  { kind: 'intermediate_block', label: "Alter an intermediate block's hash_anterior (whole chain must fail)" },
+  { kind: 'block_hash', label: "Alter an intermediate block's stored hash" },
   { kind: 'reward_amount', label: 'Falsify a confirmed PoW reward' },
 ] as const;
 

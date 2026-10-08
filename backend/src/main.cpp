@@ -73,7 +73,16 @@ int main() {
 
     int64_t initial_stake = env::get_int("INITIAL_STAKE", 100);
     NodeNetwork network;
-    ConsensusCoordinator consensus(ledger, db, network, env::get_int("MAX_TX_PER_BLOCK", 10), initial_stake);
+    ledger.block_reward = env::get_int("BLOCK_REWARD", 10);
+    ledger.release_all_locks();  // a crash mid-round must not leave stake locked forever
+    ConsensusCoordinator::Config ccfg;
+    ccfg.max_tx_per_block = env::get_int("MAX_TX_PER_BLOCK", 10);
+    ccfg.initial_stake = initial_stake;
+    ccfg.tx_value = env::get_int("TX_VALUE", 10);
+    ccfg.pos_reward = env::get_int("POS_REWARD", 5);
+    ccfg.phase_delay_ms = env::get_int("PHASE_DELAY_MS", 250);
+    ccfg.default_seed = static_cast<uint64_t>(env::get_int("SEED", 0));
+    ConsensusCoordinator consensus(ledger, db, network, ccfg);
     AppContext ctx{db,
                    ledger,
                    consensus,
@@ -81,7 +90,10 @@ int main() {
                    rules,
                    initial_stake,
                    env::get_int("MAX_TX_PER_BLOCK", 10),
-                   static_cast<int64_t>(env::get_int("TIMESTAMP_SKEW_SECONDS", 300)) * 1000};
+                   static_cast<int64_t>(env::get_int("TIMESTAMP_SKEW_SECONDS", 300)) * 1000,
+                   ledger.block_reward,
+                   ccfg.pos_reward,
+                   ccfg.tx_value};
 
     httplib::Server svr;
     svr.set_payload_max_length(25 * 1024 * 1024);

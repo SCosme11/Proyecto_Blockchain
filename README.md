@@ -28,15 +28,23 @@ Both modes share `chain::BlockHeader`, the canonical transaction format, and the
 |---|---|---|
 | Who may seal blocks | Any registered node, as a miner. | Only the node a stake-weighted lottery ("sorteo") selects. |
 | Who wins | The first miner to find a nonce whose block hash has `d` leading **hex** zero digits. Miner `i` of `N` only tries nonces `i, i+N, i+2N, …` — disjoint by construction, so a tie is settled by **smallest winning nonce** (never a real collision). | A proposer drawn with probability proportional to its stake. The block seals once validators holding **≥ 2/3 of the active stake** sign it (the classic BFT bound, tolerating < 1/3 faulty/offline stake). |
-| Misbehavior | N/A (any registered key can mine). | A node flagged **dishonest** proposes a block with a corrupted signature; honest validators reject it, it is **slashed** following a configurable rule (`punishment_rule` on `POST /api/consensus/propose`): **A** forfeits the whole stake and bars the node forever, **B** forfeits only `ceil(alpha * stake)` (0 < alpha ≤ 1) and keeps the node eligible — and the sorteo repeats with an incremented "intento" over the remaining pool either way. |
-| Reward | Pending until the chain reaches `height + 6` ("6 confirmations"), then confirmed — a counter, never a spendable balance. | Stake is itself the counter; it is adjusted directly (`POST /api/nodes/:id/stake`), never transferred between nodes. |
+| Bets | N/A | Every validator bets `0 < a_i ≤ its stake` (default: `bet_pct`% of it, or an explicit `bets: {node: amount}`); the bet is **locked** for the round and released when it ends. The lottery and the votes are weighted by the bet. `validators: k` restricts the round to a seeded random subset of k nodes. |
+| Misbehavior | N/A (any registered key can mine). | A node flagged **dishonest** proposes a block with a corrupted signature; honest validators vote **no**, it is **slashed** following a configurable rule (`punishment_rule` on `POST /api/consensus/propose`): **A** `c = a_p` (loses its whole bet and is barred from future rounds), **B** `c = min(a_p, ceil(alpha · tx_count · TX_VALUE))` (0 < alpha ≤ 1; keeps the node eligible) — and the sorteo repeats with an incremented "intento" over the remaining pool either way. |
+| Reward | Pending until the chain reaches `height + 6` ("6 confirmations"); only then `BLOCK_REWARD` is credited to the miner's **balance** (available). `POST /api/rewards/:h/claim` before that answers 409 with the missing confirmations. | `POS_REWARD` is credited to the proposer's balance as soon as the block is accepted. |
+| State machine | `MINANDO → GANADOR` | `APUESTAS → SORTEO → CANDIDATO → VOTACION → ACEPTADO / RECHAZADO` (shown live in the UI and returned as `phase` / `phase_log`). |
 
-There is no transferable balance and no double-spend concern anywhere in the system (by design — see `report/reporte.tex` §5): "stake" and "reward" are bookkeeping counters, not currency.
+The assignment's "transactions between accounts" are replaced by this system's real transactions (signed reviewer approvals), so there is no transferable money and no double spend in the guide's sense (see `report/reporte.tex` §5). The guide's balance-related cases map to the node's **stake** (apuesta mayor al saldo, cero o negativa → rejected) and to the **one-signature-per-work-item** rule (double submission → 409). *Balance* (rewards) and *stake* (what can be bet) are separate counters.
+
+**Reproducible randomness:** the lottery itself is deterministic from chain data (`prev_hash|height|attempt`). Everything else that is random (which nodes form the validator subset, vote delays) derives from a `seed` (`SEED` in `.env` or `{"seed": N}` per round) — same seed, same behaviour.
+
+**External votes:** `POST /api/consensus/vote {validator, vote}` during `VOTACION` (use `vote_window_ms` to keep it open). Only validators simulated as non-responsive (`abstain`) can still vote; a vote from a non-validator is **403**, a second vote from the same validator (or from one that already votes by itself) is **409**, and both are written to the log.
 
 ## Node range and chain copies
 
 * `10 ≤ N ≤ 20` nodes, enforced server-side (`POST /api/nodes`, `POST /api/consensus/propose`) regardless of what the UI already restricts to.
-* Every node additionally keeps its **own** in-memory chain mirror (`backend/src/network.*`). After a block is sealed on the reference ledger it is broadcast to every mirror; each one independently re-runs the **full** block check (`Ledger::check_block`: hash recompute, PoW difficulty or PoS proposer-selection + quorum + every signature) against its own stored tip before adopting it — not just a shallow linkage check. The "Nodes" panel in the Consensus arena shows each node's height/hash and whether it is in sync — and the tamper demo can corrupt one node's mirror on demand to show it falling out of sync until explicitly resynced.
+* Every node keeps its **own full copy** of the chain in memory (`backend/src/network.*`: blocks, transactions, votes, stake snapshots). After a block is sealed it is broadcast to every node; each one re-runs the **full** block check (`Ledger::check_block`) against its own tip and refuses the block if its own copy is invalid.
+* **Longest valid chain rule (guide §2.4):** a chain received from a peer (`POST /api/nodes/:id/receive-chain {kind: valid|shorter|tampered}`, or `/resync`) is adopted only if **every** block validates from genesis **and** it is longer than the node's own chain (a node whose own copy is invalid accepts any valid chain at least as long). Otherwise it is rejected with the reason and the node keeps its chain.
+* The tamper demo corrupts a block **in the middle** of a node's own copy (`node_copy`) or of the reference chain (`intermediate_block`, `block_hash`); the whole chain is then rejected from that block on.
 * `GET /api/events` merges sealed/rejected rounds, slashing events and matured rewards into one chronological "bitácora", shown in the Consensus arena.
 
 ## What the reviewer signs
@@ -56,6 +64,8 @@ v1|work_item_id|work_hash|artifact_type|score|rules_hash|decision|sha256(comment
 * every block hash, and that each block links to the previous one
 * PoW blocks: the hash meets the stored hex-zero-digit difficulty
 * PoS blocks: that the proposer was the legitimate stake-weighted selection for that height (replaying the sorteo over the stake snapshot frozen at round time), that the recorded votes reach the ≥ 2/3 stake quorum, and that each vote's signature is valid
+* PoS vote set: every voter belongs to that round's stake snapshot, votes at most once, with exactly the snapshot's stake, and `total_stake` equals the snapshot's sum
+* PoW difficulty is at least 1 hex zero
 * the proposer's own signature over the block hash
 * the merkle roots and the tx_ids
 * each auditor's signature and fingerprint
@@ -87,9 +97,11 @@ npm run dev                 # open http://localhost:5173 (it proxies /api to :80
 * `C:\msys64\ucrt64\bin` must be on your `PATH` when you run the server, because it needs the OpenSSL and libpq DLLs.
 * On Linux or macOS, install OpenSSL 3, libpq, CMake and Ninja with your package manager. The rest of the steps are the same.
 * **Single-server mode:** run `npm run build`. The C++ node then serves `frontend/dist` itself at `http://127.0.0.1:8080`.
-* **Upgrading from a pre-PoS database:** the schema has no migrations (`CREATE TABLE IF NOT EXISTS` only). If your `ai_ledger`
-  database still has the old `miners`/`mining_rounds` tables, drop the whole database (`DROP DATABASE ai_ledger;`) before
-  starting the new server, so it can recreate it from the current schema.
+* **Upgrading:** the new columns (`nodes.balance`, `nodes.locked`, `pow_rewards.amount`) and the `event_log` table are added
+  idempotently on startup (`ALTER TABLE … ADD COLUMN IF NOT EXISTS`). Only a database from before PoS (old `miners`/`mining_rounds`
+  tables) still needs `DROP DATABASE ai_ledger;`.
+* **Linux / macOS (clean machine):** install OpenSSL 3, libpq, CMake, Ninja and Node; start PostgreSQL (or `docker compose up -d`, which
+  provides one on :5432 with the credentials in `.env.example`); then `cp .env.example .env`, build and run as above.
 
 ### Tests
 
@@ -100,12 +112,18 @@ node scripts/e2e.mjs http://127.0.0.1:8080   # happy-path smoke test
 node scripts/casos.mjs http://127.0.0.1:8080 # section-5 robustness cases from the guide
 ```
 
+Run them against a throw-away database so your demo data is untouched:
+`PGDATABASE=ai_ledger_test SERVER_PORT=8081 PHASE_DELAY_MS=30 ./build/ledger_server` and point the scripts at `:8081`.
+
 Both scripts **reset the demo data**. `e2e.mjs`: submits LOW/MEDIUM/HIGH work, signs the MEDIUM item with WebCrypto, checks
 forged/LOW-confidence transactions are rejected, seals a PoS block with 10 nodes, runs a second round with a dishonest
 proposer (checks it still seals and the proposer gets slashed), corrupts and restores one node's local chain copy, then
-verifies the chain and runs each tamper attack. `casos.mjs` specifically drives the edge cases in section 5 of the guide: N
-out of range, invalid difficulty, empty mempool, no-stake/negative-stake, a round already running, and mining ≥10 PoW blocks
-in a row to watch a reward mature at height+6. `backend/build/ledger_selftest.exe` covers the pure math (nonce-partition
+verifies the chain and runs each tamper attack. `casos.mjs` drives the edge cases in section 5 of the guide:
+malformed/mistyped requests (never a 500), N and difficulty out of range, empty mempool, forged/foreign/duplicated signatures and
+concurrent double submission, intermediate-block tampering, shorter/invalid chains received by a node, bets above/zero/negative,
+locked stake, vote of a non-validator and double votes, quorum exactly at and one vote below 2/3, dishonest proposers under both
+punishment rules, all validators slashed, PoW cancellation, 10 PoW blocks in a row, reward claimed before 6 confirmations, a seeded
+reproducible validator subset, two tabs starting a round at once and resetting mid-round. `backend/build/ledger_selftest.exe` covers the pure math (nonce-partition
 uniqueness, the quorum-threshold lemma, redraw termination) without needing Postgres at all.
 
 ## Try it out in the UI
@@ -155,7 +173,8 @@ report/reporte.tex        4-page academic report: math behind every design decis
 ## Known limitations (demo scope)
 
 * Node private keys are stored in Postgres so the demo can create N nodes on demand. In production, each node keeps its own key, ideally in an HSM.
-* All nodes are threads/mirrors inside a single process; PoW hashing and PoS votes are real, but there is no real network — "broadcast" is an in-process function call, and per-node chain mirrors store only (height, hash), not full history.
-* No balances, transfers or double-spend: stake and rewards are internal counters by design (see `report/reporte.tex`), not a currency.
+* All nodes are threads inside a single process; PoW hashing and PoS votes are real, and each node holds its own full chain copy, but there is no real network — "broadcast" is an in-process function call and nodes never fork (one reference ledger decides the next block).
+* No transfers or double-spend: stake, balance and rewards are internal counters by design (see `report/reporte.tex`), not a currency.
+* The HTTP API has no authentication (demo scope): anyone who can reach it can register auditors or call the `/api/demo/*` helpers.
 * Timestamps come from the reviewer's clock, checked to within ±5 minutes of the node's clock. For legally strong timestamps, add RFC 3161 or anchor the chain periodically to a public chain.
 * HIGH-confidence work is auto-accepted and never appears on the chain. If the business needs accountability for it too, commit a periodic merkle root of those decisions to the chain.

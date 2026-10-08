@@ -94,6 +94,8 @@ static NodeRow node_from_result(const Result& r, int i) {
     v.active = r.str(i, "active") == "t";
     v.slashed = r.str(i, "slashed") == "t";
     v.dishonest = r.str(i, "dishonest") == "t";
+    v.balance = r.i64(i, "balance");
+    v.locked = r.i64(i, "locked");
     return v;
 }
 
@@ -136,9 +138,13 @@ int64_t Ledger::total_active_stake() {
 
 bool Ledger::adjust_stake(int node_id, int64_t delta, std::string& err) {
     auto l = db_.lock();
-    Result r = db_.exec("SELECT stake, slashed FROM nodes WHERE id = $1", {node_id});
+    Result r = db_.exec("SELECT stake, slashed, locked FROM nodes WHERE id = $1", {node_id});
     if (r.rows() == 0) {
         err = "node not found";
+        return false;
+    }
+    if (r.i64(0, "locked") > 0) {
+        err = "stake is locked by the consensus round in progress";
         return false;
     }
     if (r.str(0, "slashed") == "t") {
@@ -227,15 +233,18 @@ int Ledger::round_attempt(int64_t block_height) {
 }
 
 void Ledger::mature_pow_rewards(int64_t current_height) {
+    // Mark matured rewards confirmed and credit each miner's balance in one statement.
     db_.exec(
-        "UPDATE pow_rewards SET confirmed = true, confirmed_at = now() "
-        "WHERE NOT confirmed AND height + 6 <= $1",
+        "WITH m AS (UPDATE pow_rewards SET confirmed = true, confirmed_at = now() "
+        "           WHERE NOT confirmed AND height + 6 <= $1 RETURNING miner_id, amount) "
+        "UPDATE nodes n SET balance = n.balance + s.total "
+        "FROM (SELECT miner_id, SUM(amount) AS total FROM m GROUP BY miner_id) s WHERE n.id = s.miner_id",
         {current_height});
 }
 
 std::vector<RewardRow> Ledger::rewards() {
     Result r = db_.exec(
-        "SELECT pr.height, pr.miner_id, n.name AS miner_name, pr.confirmed FROM pow_rewards pr "
+        "SELECT pr.height, pr.miner_id, n.name AS miner_name, pr.confirmed, pr.amount FROM pow_rewards pr "
         "JOIN nodes n ON n.id = pr.miner_id ORDER BY pr.height DESC");
     std::vector<RewardRow> out;
     for (int i = 0; i < r.rows(); ++i) {
@@ -244,6 +253,7 @@ std::vector<RewardRow> Ledger::rewards() {
         w.miner_id = static_cast<int>(r.i64(i, "miner_id"));
         w.miner_name = r.str(i, "miner_name");
         w.confirmed = r.str(i, "confirmed") == "t";
+        w.amount = r.i64(i, "amount");
         out.push_back(w);
     }
     return out;
@@ -268,6 +278,9 @@ std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::strin
     if (h.prev_hash != expected_prev) errs.push_back("prev_hash does not link to previous block");
 
     if (b.mode == "pow") {
+        if (h.difficulty_hex_zeros < chain::kMinDifficultyHexZeros)
+            errs.push_back("proof-of-work difficulty " + std::to_string(h.difficulty_hex_zeros) + " is below the minimum " +
+                           std::to_string(chain::kMinDifficultyHexZeros));
         if (!chain::meets_difficulty(b.hash, h.difficulty_hex_zeros))
             errs.push_back("proof-of-work does not meet " + std::to_string(h.difficulty_hex_zeros) + " hex zeros");
     } else {
@@ -275,9 +288,9 @@ std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::strin
         if (expected_proposer.empty() || expected_proposer != h.proposer)
             errs.push_back("proposer '" + h.proposer + "' was not the stake-weighted selection for this height");
 
-        int64_t quorum_sum = 0;
+        std::vector<chain::VoteStake> vote_stakes;
         for (const auto& v : votes) {
-            quorum_sum += v.stake_at_vote;
+            vote_stakes.push_back({v.validator_name, v.stake_at_vote});
             auto vk = node_keys.find(v.validator_name);
             if (vk == node_keys.end()) {
                 errs.push_back("vote from unregistered validator '" + v.validator_name + "'");
@@ -285,10 +298,8 @@ std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::strin
                 errs.push_back("vote signature invalid for '" + v.validator_name + "'");
             }
         }
-        if (quorum_sum != b.quorum_stake) errs.push_back("quorum_stake does not match the sum of recorded votes");
-        if (b.quorum_stake < chain::quorum_threshold(b.total_stake))
-            errs.push_back("quorum not reached: " + std::to_string(b.quorum_stake) + "/" +
-                           std::to_string(b.total_stake) + " stake signed");
+        for (auto& e : chain::check_vote_set(stake_snapshot, vote_stakes, b.total_stake, b.quorum_stake))
+            errs.push_back(std::move(e));
     }
 
     auto pk = node_keys.find(h.proposer);
@@ -335,7 +346,7 @@ std::vector<std::string> Ledger::check_block(const BlockRow& b, const std::strin
 
 void Ledger::commit_block(const BlockRow& b, const std::vector<TxRow>& txs,
                           const std::vector<chain::StakeEntry>& stake_snapshot, int attempt,
-                          const std::vector<VoteRow>& votes, const json& round) {
+                          const std::vector<VoteRow>& votes, const json& round, int64_t proposer_reward) {
     Db::Transaction tx(db_);
     BlockRow prev = tip();
     if (b.header.height != prev.header.height + 1) throw DbError("stale block: height already taken");
@@ -373,28 +384,42 @@ void Ledger::commit_block(const BlockRow& b, const std::vector<TxRow>& txs,
     if (b.mode == "pow") {
         Result miner = db_.exec("SELECT id FROM nodes WHERE name = $1", {h.proposer});
         if (miner.rows() == 1)
-            db_.exec("INSERT INTO pow_rewards (height, miner_id) VALUES ($1,$2)", {h.height, miner.i64(0, "id")});
+            db_.exec("INSERT INTO pow_rewards (height, miner_id, amount) VALUES ($1,$2,$3)",
+                     {h.height, miner.i64(0, "id"), block_reward});
+    } else if (proposer_reward > 0) {
+        db_.exec("UPDATE nodes SET balance = balance + $1 WHERE name = $2", {proposer_reward, h.proposer});
     }
     mature_pow_rewards(h.height);
     tx.commit();
 }
 
-json Ledger::verify_chain() {
+std::vector<ChainBlock> Ledger::export_chain() {
     auto l = db_.lock();
     Result r = db_.exec("SELECT * FROM blocks ORDER BY height");
-    auto keys = node_keys();
+    std::vector<ChainBlock> out;
+    for (int i = 0; i < r.rows(); ++i) {
+        ChainBlock cb;
+        cb.block = block_from_result(r, i);
+        int64_t height = cb.block.header.height;
+        cb.txs = block_txs(height);
+        cb.snapshot = round_stake_snapshot(height);
+        cb.attempt = round_attempt(height);
+        cb.votes = block_votes(height);
+        out.push_back(std::move(cb));
+    }
+    return out;
+}
+
+json Ledger::validate_chain(const std::vector<ChainBlock>& chain_blocks,
+                            const std::map<std::string, std::string>& keys, bool check_artifacts) {
     json blocks = json::array();
     std::string prev_hash;
     json first_bad = nullptr;
     int64_t expected_height = 0;
 
-    for (int i = 0; i < r.rows(); ++i) {
-        BlockRow b = block_from_result(r, i);
-        auto txs = block_txs(b.header.height);
-        auto stake_snapshot = round_stake_snapshot(b.header.height);
-        int attempt = round_attempt(b.header.height);
-        auto votes = block_votes(b.header.height);
-        auto errs = check_block(b, prev_hash, txs, keys, stake_snapshot, attempt, votes, true);
+    for (const auto& cb : chain_blocks) {
+        const BlockRow& b = cb.block;
+        auto errs = check_block(b, prev_hash, cb.txs, keys, cb.snapshot, cb.attempt, cb.votes, check_artifacts);
         if (b.header.height != expected_height) errs.push_back("height gap in chain");
         // Once a block is broken, every later block inherits a broken history.
         if (errs.empty() && !first_bad.is_null()) errs.push_back("descends from invalid block " + first_bad.dump());
@@ -405,4 +430,28 @@ json Ledger::verify_chain() {
     }
     return {{"ok", first_bad.is_null()}, {"height", expected_height - 1}, {"first_bad_height", first_bad},
             {"blocks", blocks}};
+}
+
+json Ledger::verify_chain() {
+    auto l = db_.lock();
+    return validate_chain(export_chain(), node_keys(), true);
+}
+
+std::optional<RewardRow> Ledger::reward(int64_t height) {
+    for (auto& w : rewards())
+        if (w.height == height) return w;
+    return std::nullopt;
+}
+
+int64_t Ledger::tip_height() { return tip().header.height; }
+
+void Ledger::lock_bets(const std::map<int, int64_t>& bets) {
+    auto l = db_.lock();
+    for (const auto& [id, amount] : bets) db_.exec("UPDATE nodes SET locked = $1 WHERE id = $2", {amount, id});
+}
+
+void Ledger::release_all_locks() { db_.exec("UPDATE nodes SET locked = 0"); }
+
+void Ledger::log_event(const std::string& type, const std::string& message) {
+    db_.exec("INSERT INTO event_log (type, message) VALUES ($1,$2)", {type, message});
 }

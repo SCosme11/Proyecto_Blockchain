@@ -143,3 +143,20 @@ CREATE TABLE IF NOT EXISTS tamper_log (
     original_bytes BYTEA,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---- Additive migrations (idempotent; safe on databases created before these columns) ----
+-- nodes.stake is the node's staking pool; nodes.locked is the part of it bet in the round that
+-- is currently running (released when the round ends); nodes.balance holds credited rewards.
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS balance BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS locked  BIGINT NOT NULL DEFAULT 0;
+-- Reward paid to the miner once the block is 6 confirmations deep.
+ALTER TABLE pow_rewards ADD COLUMN IF NOT EXISTS amount BIGINT NOT NULL DEFAULT 0;
+
+-- Human-readable audit trail ("bitácora") of events that have no table of their own:
+-- nodes rejecting a chain/block, tamper/restore, rejected votes, claims of immature rewards...
+CREATE TABLE IF NOT EXISTS event_log (
+    id         SERIAL PRIMARY KEY,
+    type       TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
